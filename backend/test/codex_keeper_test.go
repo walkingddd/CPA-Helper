@@ -28,8 +28,12 @@ type keeperAccountsResponse struct {
 	Items []struct {
 		Name           string  `json:"name"`
 		AccountType    *string `json:"account_type"`
+		Disabled       bool    `json:"disabled"`
 		Priority       *int    `json:"priority"`
 		PrimaryResetAt *string `json:"primary_reset_at"`
+		LastStatusCode *int    `json:"last_status_code"`
+		LastError      *string `json:"last_error"`
+		LatestAction   *string `json:"latest_action"`
 		LastCheckedAt  *string `json:"last_checked_at"`
 		LastHealthyAt  *string `json:"last_healthy_at"`
 	} `json:"items"`
@@ -395,6 +399,282 @@ func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
 	expectedPatches["manual-quota-high.json"] = []int{-1, 100}
 	assertKeeperPriorityPatchesLocked(t, patches, expectedPatches)
 	mu.Unlock()
+}
+
+func TestKeeperRefreshAccountsOnlyProcessesSelectedAuths(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	authDetails := map[string]map[string]any{
+		"refresh-me.json": {
+			"name":         "refresh-me.json",
+			"type":         "codex",
+			"email":        "refresh@example.com",
+			"account_type": "free",
+			"disabled":     false,
+			"priority":     0,
+			"access_token": "test-token",
+		},
+		"skip-me.json": {
+			"name":         "skip-me.json",
+			"type":         "codex",
+			"email":        "skip@example.com",
+			"account_type": "free",
+			"disabled":     false,
+			"priority":     0,
+			"access_token": "test-token",
+		},
+	}
+	var mu sync.Mutex
+	usageCalls := map[string]int{}
+
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{"name": "refresh-me.json", "type": "codex"},
+					{"name": "skip-me.json", "type": "codex"},
+					{"name": "not-codex.json", "type": "openai"},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			detail, ok := authDetails[r.URL.Query().Get("name")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(detail)
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				AuthIndex string `json:"auth_index"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			mu.Lock()
+			usageCalls[payload.AuthIndex]++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status_code": 200,
+				"body": map[string]any{
+					"plan_type": "free",
+					"rate_limit": map[string]any{
+						"primary_window": map[string]any{
+							"used_percent":        10,
+							"reset_after_seconds": 3600,
+						},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     cpa.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
+		"schedule_cron":       "0 0 29 2 *",
+		"dry_run":             false,
+		"quota_threshold":     100,
+		"worker_threads":      1,
+		"cpa_timeout_seconds": 1,
+	}, cookies, nil)
+
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/accounts/refresh", map[string]any{
+		"auth_names": []string{"refresh-me.json"},
+	}, cookies, nil)
+	response := waitForKeeperAccounts(t, handler, cookies, 1)
+	if response.Items[0].Name != "refresh-me.json" {
+		t.Fatalf("refreshed account = %q, want refresh-me.json", response.Items[0].Name)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := usageCalls["refresh-me.json"]; got != 1 {
+		t.Fatalf("refresh-me usage calls = %d, want 1", got)
+	}
+	if got := usageCalls["skip-me.json"]; got != 0 {
+		t.Fatalf("skip-me usage calls = %d, want 0", got)
+	}
+}
+
+func TestKeeperRefreshAccountsUpdatesStateWithoutRemoteMutation(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	authDetails := map[string]map[string]any{
+		"quota-high.json": {
+			"name":         "quota-high.json",
+			"type":         "codex",
+			"email":        "quota@example.com",
+			"account_type": "free",
+			"disabled":     false,
+			"priority":     0,
+			"access_token": "test-token",
+		},
+		"bad-token.json": {
+			"name":         "bad-token.json",
+			"type":         "codex",
+			"email":        "bad@example.com",
+			"account_type": "free",
+			"disabled":     false,
+			"priority":     0,
+			"access_token": "bad-token",
+		},
+	}
+	var mu sync.Mutex
+	statusPatchCount := 0
+	priorityPatchCount := 0
+
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{"name": "quota-high.json", "type": "codex"},
+					{"name": "bad-token.json", "type": "codex"},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			detail, ok := authDetails[r.URL.Query().Get("name")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(detail)
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				AuthIndex string `json:"auth_index"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			statusCode := 200
+			usedPercent := 100
+			if payload.AuthIndex == "bad-token.json" {
+				statusCode = 401
+				usedPercent = 0
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status_code": statusCode,
+				"body": map[string]any{
+					"plan_type": "free",
+					"rate_limit": map[string]any{
+						"primary_window": map[string]any{
+							"used_percent":        usedPercent,
+							"reset_after_seconds": 3600,
+						},
+					},
+				},
+			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/status":
+			mu.Lock()
+			statusPatchCount++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			mu.Lock()
+			priorityPatchCount++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     cpa.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
+		"schedule_cron":       "0 0 29 2 *",
+		"dry_run":             false,
+		"quota_threshold":     50,
+		"worker_threads":      1,
+		"cpa_timeout_seconds": 1,
+	}, cookies, nil)
+
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/accounts/refresh", map[string]any{
+		"auth_names": []string{"quota-high.json", "bad-token.json"},
+	}, cookies, nil)
+	response := waitForKeeperAccounts(t, handler, cookies, 2)
+
+	items := map[string]struct {
+		Disabled       bool
+		Priority       *int
+		LastStatusCode *int
+		LastError      *string
+	}{}
+	for _, item := range response.Items {
+		items[item.Name] = struct {
+			Disabled       bool
+			Priority       *int
+			LastStatusCode *int
+			LastError      *string
+		}{
+			Disabled:       item.Disabled,
+			Priority:       item.Priority,
+			LastStatusCode: item.LastStatusCode,
+			LastError:      item.LastError,
+		}
+	}
+
+	quota := items["quota-high.json"]
+	if quota.Priority == nil || *quota.Priority != 0 {
+		t.Fatalf("quota-high priority = %v, want unchanged 0", quota.Priority)
+	}
+	if quota.LastError != nil {
+		t.Fatalf("quota-high last_error = %v, want nil", *quota.LastError)
+	}
+	bad := items["bad-token.json"]
+	if bad.Disabled {
+		t.Fatal("bad-token disabled = true, want false when refresh only updates state")
+	}
+	if bad.LastStatusCode == nil || *bad.LastStatusCode != 401 {
+		t.Fatalf("bad-token last_status_code = %v, want 401", bad.LastStatusCode)
+	}
+	if bad.LastError == nil || !strings.Contains(*bad.LastError, "凭证不可用") {
+		t.Fatalf("bad-token last_error = %v, want credential error", bad.LastError)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if statusPatchCount != 0 {
+		t.Fatalf("status patch count = %d, want 0", statusPatchCount)
+	}
+	if priorityPatchCount != 0 {
+		t.Fatalf("priority patch count = %d, want 0", priorityPatchCount)
+	}
 }
 
 func TestKeeperAccountsReturnBeijingOffsetTimeStrings(t *testing.T) {

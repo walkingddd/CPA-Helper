@@ -91,6 +91,10 @@ type keeperBulkDeleteRequest struct {
 	AuthNames []string `json:"auth_names"`
 }
 
+type keeperRefreshAccountsRequest struct {
+	AuthNames []string `json:"auth_names"`
+}
+
 type keeperPriorityUpdateRequest struct {
 	Priority int `json:"priority"`
 }
@@ -220,6 +224,18 @@ func (r *KeeperRunner) StartOnce() error {
 		return conflictError("Codex Keeper 正在运行")
 	}
 	go r.run("once")
+	return nil
+}
+
+func (r *KeeperRunner) StartAccounts(authNames []string) error {
+	names, err := normalizeKeeperAuthNames(authNames)
+	if err != nil {
+		return err
+	}
+	if !r.markRunning("accounts") {
+		return conflictError("Codex Keeper 正在运行")
+	}
+	go r.runAccounts("accounts", names)
 	return nil
 }
 
@@ -366,7 +382,11 @@ func (r *KeeperRunner) markRunning(mode string) bool {
 	runningMode := mode
 	r.running = true
 	r.state = "running"
-	r.detail = "正在巡检 Codex 账号"
+	if mode == "accounts" {
+		r.detail = "正在刷新 Codex 账号"
+	} else {
+		r.detail = "正在巡检 Codex 账号"
+	}
 	r.mode = &runningMode
 	r.lastStartedAt = &now
 	r.lastFinishedAt = nil
@@ -375,7 +395,11 @@ func (r *KeeperRunner) markRunning(mode string) bool {
 }
 
 func (r *KeeperRunner) run(mode string) {
-	stats, detail, err := r.app.executeKeeperRun(context.Background(), mode, r.log)
+	r.runAccounts(mode, nil)
+}
+
+func (r *KeeperRunner) runAccounts(mode string, authNames []string) {
+	stats, detail, err := r.app.executeKeeperRunForAccounts(context.Background(), mode, authNames, r.log)
 	finishedAt := time.Now().In(appTimeLocation)
 	logMessage := detail
 	r.mu.Lock()
@@ -653,6 +677,19 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		return a.bulkDeleteKeeperAccounts(w, r)
+	case len(parts) == 2 && parts[0] == "accounts" && parts[1] == "refresh":
+		if err := requireMethod(r, http.MethodPost); err != nil {
+			return err
+		}
+		var payload keeperRefreshAccountsRequest
+		if err := decodeJSON(r, &payload); err != nil {
+			return err
+		}
+		if err := a.keeper.StartAccounts(payload.AuthNames); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
+		return nil
 	case len(parts) == 3 && parts[0] == "accounts" && (parts[2] == "enable" || parts[2] == "disable"):
 		if err := requireMethod(r, http.MethodPost); err != nil {
 			return err
@@ -823,6 +860,10 @@ func (a *App) updateKeeperSettings(w http.ResponseWriter, r *http.Request) error
 }
 
 func (a *App) executeKeeperRun(ctx context.Context, mode string, logFn func(string)) (keeperStats, string, error) {
+	return a.executeKeeperRunForAccounts(ctx, mode, nil, logFn)
+}
+
+func (a *App) executeKeeperRunForAccounts(ctx context.Context, mode string, authNames []string, logFn func(string)) (keeperStats, string, error) {
 	cfg, err := a.loadConfig(ctx)
 	if err != nil {
 		return keeperStats{}, "", err
@@ -834,7 +875,20 @@ func (a *App) executeKeeperRun(ctx context.Context, mode string, logFn func(stri
 	if err != nil {
 		return keeperStats{}, "", err
 	}
-	logFn("开始 Codex 账号巡检")
+	targetNames, err := normalizeOptionalKeeperAuthNames(authNames)
+	if err != nil {
+		_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), keeperStats{})
+		return keeperStats{}, "", err
+	}
+	targetSet := map[string]bool{}
+	for _, name := range targetNames {
+		targetSet[name] = true
+	}
+	if len(targetSet) > 0 {
+		logFn(fmt.Sprintf("开始刷新 %d 个 Codex 账号", len(targetSet)))
+	} else {
+		logFn("开始 Codex 账号巡检")
+	}
 	stats := keeperStats{}
 	detail := "巡检完成"
 	authFiles, err := a.listKeeperRemoteAuthFiles(ctx, cfg)
@@ -844,29 +898,41 @@ func (a *App) executeKeeperRun(ctx context.Context, mode string, logFn func(stri
 	}
 	filtered := make([]map[string]any, 0, len(authFiles))
 	for _, item := range authFiles {
-		if keeperString(item["type"]) == "codex" {
+		if keeperString(item["type"]) != "codex" {
+			continue
+		}
+		name := keeperString(item["name"])
+		if len(targetSet) == 0 || targetSet[name] {
 			filtered = append(filtered, item)
 		}
 	}
 	stats.Total = len(filtered)
 	if len(filtered) == 0 {
-		detail = "未发现 Codex auth file"
+		if len(targetSet) > 0 {
+			detail = "未发现指定 Codex auth file"
+		} else {
+			detail = "未发现 Codex auth file"
+		}
 		_ = a.finishKeeperRun(ctx, runID, "completed", detail, stats)
 		return stats, detail, nil
 	}
 	for _, item := range filtered {
-		result := a.processKeeperAuth(ctx, cfg, item, logFn)
+		result := a.processKeeperAuth(ctx, cfg, item, logFn, mode == "accounts")
 		a.mergeKeeperStats(&stats, result)
 		if err := a.recordKeeperRunAccount(ctx, runID, result); err != nil {
 			logFn("写入巡检账号历史失败：" + err.Error())
 		}
 	}
-	detail = fmt.Sprintf("巡检完成：健康 %d，坏凭证禁用 %d，优先级降级 %d，网络错误 %d", stats.Healthy, stats.StatusDisabled, stats.PriorityDegraded, stats.NetworkError)
+	if len(targetSet) > 0 {
+		detail = fmt.Sprintf("账号刷新完成：健康 %d，凭证异常 %d，网络错误 %d", stats.Healthy, stats.StatusDisabled, stats.NetworkError)
+	} else {
+		detail = fmt.Sprintf("巡检完成：健康 %d，坏凭证禁用 %d，优先级降级 %d，网络错误 %d", stats.Healthy, stats.StatusDisabled, stats.PriorityDegraded, stats.NetworkError)
+	}
 	_ = a.finishKeeperRun(ctx, runID, "completed", detail, stats)
 	return stats, detail, nil
 }
 
-func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map[string]any, logFn func(string)) keeperAccountResult {
+func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map[string]any, logFn func(string), stateOnly bool) keeperAccountResult {
 	now := time.Now().In(appTimeLocation)
 	name := keeperString(authInfo["name"])
 	if name == "" {
@@ -902,8 +968,8 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	}
 	if keeperString(merged["access_token"]) == "" {
 		message := "缺少 access token"
-		action := "模拟禁用：" + message
-		if !cfg.CodexKeeper.DryRun {
+		action := "刷新发现凭证不可用：" + message
+		if !stateOnly && !cfg.CodexKeeper.DryRun {
 			if err := a.setKeeperRemoteDisabled(ctx, cfg, name, true); err != nil {
 				message = "禁用坏凭证失败：" + err.Error()
 				result.LastError = &message
@@ -915,6 +981,8 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 			disabled = true
 			result.Disabled = &disabled
 			action = "禁用凭证：" + message
+		} else if !stateOnly {
+			action = "模拟禁用：" + message
 		}
 		result.Result = "status_disabled"
 		result.LastError = &message
@@ -940,8 +1008,8 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		if usageResult.Brief != "" {
 			message += "，" + usageResult.Brief
 		}
-		action := "模拟禁用：" + message
-		if !cfg.CodexKeeper.DryRun {
+		action := "刷新发现凭证不可用：" + message
+		if !stateOnly && !cfg.CodexKeeper.DryRun {
 			if err := a.setKeeperRemoteDisabled(ctx, cfg, name, true); err != nil {
 				message = "禁用坏凭证失败：" + err.Error()
 				result.Result = "network_error"
@@ -953,6 +1021,8 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 			disabled = true
 			result.Disabled = &disabled
 			action = "禁用凭证：" + message
+		} else if !stateOnly {
+			action = "模拟禁用：" + message
 		}
 		result.Result = "status_disabled"
 		result.LastError = &message
@@ -980,6 +1050,19 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.SecondaryResetAt = usage.SecondaryResetAt
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
 	result.Result = "healthy"
+
+	if stateOnly {
+		accountType := "unknown"
+		if result.AccountType != nil && strings.TrimSpace(*result.AccountType) != "" {
+			accountType = *result.AccountType
+		}
+		action := fmt.Sprintf("刷新完成，类型 %s", accountType)
+		result.LatestAction = &action
+		result.LastError = nil
+		_ = a.upsertKeeperState(ctx, result)
+		logFn(name + ": " + action)
+		return result
+	}
 
 	var restorePriority *int
 	if state, err := a.getKeeperState(ctx, name); err == nil {
@@ -1753,6 +1836,17 @@ func briefAny(value any) string {
 }
 
 func normalizeKeeperAuthNames(raw []string) ([]string, error) {
+	result, err := normalizeOptionalKeeperAuthNames(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		return nil, validationError("账号名称不能为空")
+	}
+	return result, nil
+}
+
+func normalizeOptionalKeeperAuthNames(raw []string) ([]string, error) {
 	seen := map[string]bool{}
 	result := []string{}
 	for _, item := range raw {
@@ -1765,9 +1859,6 @@ func normalizeKeeperAuthNames(raw []string) ([]string, error) {
 		}
 		seen[name] = true
 		result = append(result, name)
-	}
-	if len(result) == 0 {
-		return nil, validationError("账号名称不能为空")
 	}
 	return result, nil
 }

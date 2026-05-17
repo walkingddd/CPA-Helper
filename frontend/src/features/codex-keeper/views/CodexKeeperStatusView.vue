@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   NButton,
   NDataTable,
@@ -12,7 +12,6 @@ import {
   NInput,
   NInputNumber,
   NModal,
-  NPopconfirm,
   NSelect,
   NSpace,
   NTag,
@@ -40,8 +39,10 @@ import {
   deleteCodexKeeperAccount,
   disableCodexKeeperAccount,
   enableCodexKeeperAccount,
+  getCodexKeeperStatus,
   getCodexKeeperSettings,
   listCodexKeeperAccounts,
+  refreshCodexKeeperAccounts,
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type { CodexKeeperAccount, CodexKeeperPriorityRule } from '@/shared/types/api'
@@ -56,7 +57,8 @@ type AccountListViewMode = 'table' | 'bar' | 'ring'
 type AccountSortKey = 'quotaDay' | 'quotaWeek' | 'accountType' | 'status' | 'priority' | 'lastCheckedAt'
 type SortDirection = 'asc' | 'desc'
 type PriorityMode = 'low' | 'high' | 'default'
-type AccountAction = 'toggle' | 'priority' | 'delete'
+type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh'
+type AccountConfirmType = 'default' | 'warning' | 'error' | 'primary'
 type QuotaWindowItem = { label: string; remainingPercent: number; resetAt: string | null }
 type AccountStatusPreferences = {
   displaySize?: unknown
@@ -71,16 +73,20 @@ const ACCOUNT_STATUS_PREFERENCE_STORAGE_KEY = 'cpa-helper-codex-keeper-status-pr
 const ACCOUNT_TABLE_MIN_ROW_HEIGHT = 52
 const ACCOUNT_TABLE_MAX_HEIGHT = 'min(620px, max(320px, calc(100dvh - 430px)))'
 const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
-const disabledTableScrollX = 1810
-const normalTableScrollX = 1770
+const disabledTableScrollX = 1850
+const normalTableScrollX = 1814
+const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
 const isLoading = ref(false)
 const isBulkDeleting = ref(false)
+const isBulkRefreshing = ref(false)
 const actingActions = ref<Set<string>>(new Set())
 const accounts = ref<CodexKeeperAccount[]>([])
 const priorityRules = ref<CodexKeeperPriorityRule[]>([])
 const selectedAccount = ref<CodexKeeperAccount | null>(null)
 const selectedDisabledAccountKeys = ref<DataTableRowKey[]>([])
+const refreshSelectMode = ref(false)
+const selectedRefreshAccountNames = ref<string[]>([])
 const detailOpen = ref(false)
 const accountDisplaySize = ref<AccountDisplaySize>(50)
 const accountListViewMode = ref<AccountListViewMode>('table')
@@ -97,12 +103,22 @@ const accountSort = reactive({
 const bulkDeleteDialog = reactive({
   show: false,
 })
+const accountConfirmDialog = reactive({
+  show: false,
+  title: '',
+  content: '',
+  positiveText: '',
+  type: 'warning' as AccountConfirmType,
+  action: null as (() => Promise<void>) | null,
+})
+const isAccountConfirmSubmitting = ref(false)
 const priorityDialog = reactive({
   show: false,
   mode: 'low' as PriorityMode,
   account: null as CodexKeeperAccount | null,
   value: null as number | null,
 })
+let refreshPollToken = 0
 
 const priorityRuleMap = computed(() =>
   Object.fromEntries(priorityRules.value.map((rule) => [rule.account_type, rule.priority])),
@@ -353,6 +369,12 @@ const selectedDisabledAccountNames = computed(() =>
 )
 const selectedDisabledCount = computed(() => selectedDisabledAccountNames.value.length)
 const canBulkDelete = computed(() => selectedDisabledCount.value > 0 && !isBulkDeleting.value)
+const filteredAccountNames = computed(() => filteredAccounts.value.map((account) => account.name))
+const selectedRefreshAccountNameSet = computed(() => new Set(selectedRefreshAccountNames.value))
+const selectedRefreshCount = computed(() => selectedRefreshAccountNames.value.length)
+const canRefreshSelected = computed(
+  () => selectedRefreshCount.value > 0 && !isBulkRefreshing.value && !isLoading.value,
+)
 const bulkDeletePreviewNames = computed(() => selectedDisabledAccountNames.value.slice(0, 5))
 const bulkDeletePreviewOverflow = computed(() =>
   Math.max(0, selectedDisabledCount.value - bulkDeletePreviewNames.value.length),
@@ -791,6 +813,74 @@ function pruneSelectedDisabledAccountKeys() {
   )
 }
 
+function pruneSelectedRefreshAccountNames() {
+  const availableNames = new Set(filteredAccountNames.value)
+  selectedRefreshAccountNames.value = selectedRefreshAccountNames.value.filter((name) =>
+    availableNames.has(name),
+  )
+}
+
+function toggleRefreshSelectMode() {
+  refreshSelectMode.value = !refreshSelectMode.value
+  if (!refreshSelectMode.value) {
+    selectedRefreshAccountNames.value = []
+  }
+}
+
+function exitRefreshSelectMode() {
+  refreshSelectMode.value = false
+  selectedRefreshAccountNames.value = []
+}
+
+function isRefreshAccountSelected(account: CodexKeeperAccount): boolean {
+  return selectedRefreshAccountNameSet.value.has(account.name)
+}
+
+function toggleRefreshAccountSelection(account: CodexKeeperAccount) {
+  if (isRowActing(account) || isBulkRefreshing.value || isBulkDeleting.value) {
+    return
+  }
+  if (isRefreshAccountSelected(account)) {
+    selectedRefreshAccountNames.value = selectedRefreshAccountNames.value.filter(
+      (name) => name !== account.name,
+    )
+    return
+  }
+  selectedRefreshAccountNames.value = [...selectedRefreshAccountNames.value, account.name]
+}
+
+function selectAllFilteredRefreshAccounts() {
+  selectedRefreshAccountNames.value = filteredAccountNames.value
+}
+
+function handleAccountCardClick(account: CodexKeeperAccount) {
+  if (refreshSelectMode.value) {
+    toggleRefreshAccountSelection(account)
+    return
+  }
+  openDetail(account)
+}
+
+function accountTableRowProps(account: CodexKeeperAccount) {
+  const isSelected = isRefreshAccountSelected(account)
+  return {
+    class: {
+      'is-refresh-selectable': refreshSelectMode.value,
+      'is-refresh-selected': isSelected,
+    },
+    onClick: (event: MouseEvent) => {
+      if (!refreshSelectMode.value) {
+        return
+      }
+      const target = event.target instanceof HTMLElement ? event.target : null
+      if (target?.closest('button, a, input, textarea, select, .n-checkbox, .n-base-selection')) {
+        return
+      }
+      toggleRefreshAccountSelection(account)
+    },
+  }
+}
+
 function openBulkDeleteDialog() {
   if (!canBulkDelete.value) {
     return
@@ -884,6 +974,64 @@ async function submitPriorityDialog() {
   priorityDialog.show = false
 }
 
+function openAccountConfirm(
+  title: string,
+  content: string,
+  positiveText: string,
+  type: AccountConfirmType,
+  action: () => Promise<void>,
+) {
+  accountConfirmDialog.title = title
+  accountConfirmDialog.content = content
+  accountConfirmDialog.positiveText = positiveText
+  accountConfirmDialog.type = type
+  accountConfirmDialog.action = action
+  accountConfirmDialog.show = true
+}
+
+async function submitAccountConfirm() {
+  if (!accountConfirmDialog.action || isAccountConfirmSubmitting.value) {
+    return
+  }
+  isAccountConfirmSubmitting.value = true
+  try {
+    await accountConfirmDialog.action()
+    accountConfirmDialog.show = false
+  } finally {
+    isAccountConfirmSubmitting.value = false
+  }
+}
+
+function confirmEnableAccount(account: CodexKeeperAccount) {
+  openAccountConfirm(
+    '启用账号',
+    `启用 ${account.name}？`,
+    '确认启用',
+    'primary',
+    () => enableAccount(account),
+  )
+}
+
+function confirmDisableAccount(account: CodexKeeperAccount) {
+  openAccountConfirm(
+    '禁用账号',
+    `禁用 ${account.name}？`,
+    '确认禁用',
+    'warning',
+    () => disableAccount(account),
+  )
+}
+
+function confirmDeleteAccount(account: CodexKeeperAccount) {
+  openAccountConfirm(
+    '删除账号',
+    `删除 ${account.name}？此操作会从 CPA 删除 auth file。`,
+    '确认删除',
+    'error',
+    () => deleteAccount(account),
+  )
+}
+
 function enableAccount(account: CodexKeeperAccount) {
   return runAccountAction(
     account,
@@ -911,6 +1059,83 @@ function deleteAccount(account: CodexKeeperAccount) {
   )
 }
 
+function refreshAccount(account: CodexKeeperAccount, options: { closeDetail?: boolean } = {}) {
+  return refreshAccounts([account.name], options)
+}
+
+async function refreshSelectedAccounts() {
+  await refreshAccounts(selectedRefreshAccountNames.value, { clearSelection: true })
+}
+
+function uniqueAccountNames(raw: string[]): string[] {
+  return [...new Set(raw.map((name) => name.trim()).filter(Boolean))]
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+async function pollRefreshUntilIdle() {
+  const token = ++refreshPollToken
+  for (;;) {
+    await sleep(REFRESH_STATUS_POLL_INTERVAL_MS)
+    if (token !== refreshPollToken) {
+      return
+    }
+    try {
+      const status = await getCodexKeeperStatus()
+      if (status.running) {
+        continue
+      }
+      await loadAccounts()
+      return
+    } catch {
+      continue
+    }
+  }
+}
+
+async function refreshAccounts(
+  rawNames: string[],
+  options: { closeDetail?: boolean; clearSelection?: boolean } = {},
+) {
+  const authNames = uniqueAccountNames(rawNames)
+  if (authNames.length === 0) {
+    return
+  }
+  const refreshKeys = authNames
+    .map((name) => accounts.value.find((account) => account.name === name))
+    .filter((account): account is CodexKeeperAccount => account !== undefined)
+    .map((account) => accountActionKey(account, 'refresh'))
+  if (refreshKeys.some((key) => actingActions.value.has(key)) || isBulkRefreshing.value) {
+    return
+  }
+  const nextActions = new Set(actingActions.value)
+  refreshKeys.forEach((key) => nextActions.add(key))
+  actingActions.value = nextActions
+  if (authNames.length > 1 || options.clearSelection) {
+    isBulkRefreshing.value = true
+  }
+  try {
+    await refreshCodexKeeperAccounts({ auth_names: authNames })
+    message.success(authNames.length === 1 ? '已开始刷新账号' : `已开始刷新 ${authNames.length} 个账号`)
+    if (options.closeDetail) {
+      detailOpen.value = false
+    }
+    if (options.clearSelection) {
+      exitRefreshSelectMode()
+    }
+    void pollRefreshUntilIdle()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '刷新账号失败')
+  } finally {
+    const restActions = new Set(actingActions.value)
+    refreshKeys.forEach((key) => restActions.delete(key))
+    actingActions.value = restActions
+    isBulkRefreshing.value = false
+  }
+}
+
 function accountActionKey(account: CodexKeeperAccount, action: AccountAction): string {
   return `${action}\u0000${account.name}`
 }
@@ -920,7 +1145,7 @@ function isActionLoading(account: CodexKeeperAccount, action: AccountAction): bo
 }
 
 function isRowActing(account: CodexKeeperAccount): boolean {
-  return (['toggle', 'priority', 'delete'] as const).some((action) =>
+  return (['toggle', 'priority', 'delete', 'refresh'] as const).some((action) =>
     isActionLoading(account, action),
   )
 }
@@ -1007,7 +1232,7 @@ const baseColumns: DataTableColumns<CodexKeeperAccount> = [
 const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
   title: '',
   key: 'actions',
-  width: 180,
+  width: 224,
   fixed: 'right',
   render: (row: CodexKeeperAccount) => {
     return h(
@@ -1021,49 +1246,40 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
             { default: () => '详情' },
           ),
           h(
-            NPopconfirm,
+            NButton,
             {
-              onPositiveClick: () =>
-                enableAccount(row),
+              size: 'small',
+              quaternary: true,
+              type: 'primary',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'toggle'),
+              onClick: () => confirmEnableAccount(row),
             },
-            {
-              trigger: () =>
-                h(
-                  NButton,
-                  {
-                    size: 'small',
-                    quaternary: true,
-                    type: 'primary',
-                    disabled: isRowActing(row) || isBulkDeleting.value,
-                    loading: isActionLoading(row, 'toggle'),
-                  },
-                  { default: () => '启用' },
-                ),
-              default: () => `启用 ${row.name}？`,
-            },
+            { default: () => '启用' },
           ),
           h(
-            NPopconfirm,
+            NButton,
             {
-              disabled: isBulkDeleting.value,
-              onPositiveClick: () =>
-                deleteAccount(row),
+              size: 'small',
+              quaternary: true,
+              type: 'error',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'delete'),
+              onClick: () => confirmDeleteAccount(row),
             },
+            { default: () => '删除' },
+          ),
+          h(
+            NButton,
             {
-              trigger: () =>
-                h(
-                  NButton,
-                  {
-                    size: 'small',
-                    quaternary: true,
-                    type: 'error',
-                    disabled: isRowActing(row) || isBulkDeleting.value,
-                    loading: isActionLoading(row, 'delete'),
-                  },
-                  { default: () => '删除' },
-                ),
-              default: () => `删除 ${row.name}？此操作会从 CPA 删除 auth file。`,
+              size: 'small',
+              quaternary: true,
+              type: 'primary',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'refresh'),
+              onClick: () => refreshAccount(row),
             },
+            { default: () => '刷新' },
           ),
         ],
       },
@@ -1074,7 +1290,7 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
 const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
   title: '',
   key: 'actions',
-  width: 188,
+  width: 232,
   fixed: 'right',
   render: (row: CodexKeeperAccount) => {
     return h(
@@ -1088,36 +1304,38 @@ const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
             { default: () => '详情' },
           ),
           h(
-            NPopconfirm,
+            NButton,
             {
-              onPositiveClick: () =>
-                disableAccount(row),
+              size: 'small',
+              quaternary: true,
+              type: 'warning',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'toggle'),
+              onClick: () => confirmDisableAccount(row),
             },
-            {
-              trigger: () =>
-                h(
-                  NButton,
-                  {
-                    size: 'small',
-                    quaternary: true,
-                    type: 'warning',
-                    disabled: isRowActing(row) || isBulkDeleting.value,
-                    loading: isActionLoading(row, 'toggle'),
-                  },
-                  { default: () => '禁用' },
-                ),
-              default: () => `禁用 ${row.name}？`,
-            },
+            { default: () => '禁用' },
           ),
           h(
             NButton,
             {
               size: 'small',
               quaternary: true,
-              disabled: isRowActing(row) || isBulkDeleting.value,
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
               onClick: () => openPriorityDialog(row),
             },
             { default: () => '优先级' },
+          ),
+          h(
+            NButton,
+            {
+              size: 'small',
+              quaternary: true,
+              type: 'primary',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'refresh'),
+              onClick: () => refreshAccount(row),
+            },
+            { default: () => '刷新' },
           ),
         ],
       },
@@ -1147,8 +1365,13 @@ watch(
   saveAccountStatusPreferences,
 )
 watch(visibleDisabledAccounts, pruneSelectedDisabledAccountKeys)
+watch(filteredAccounts, pruneSelectedRefreshAccountNames)
 
 onMounted(loadAccounts)
+
+onBeforeUnmount(() => {
+  refreshPollToken += 1
+})
 </script>
 
 <template>
@@ -1270,18 +1493,54 @@ onMounted(loadAccounts)
           />
         </div>
         <div class="list-control-row">
-          <NDropdown
-            trigger="click"
-            :options="accountListViewOptions"
-            @select="handleAccountListViewSelect"
-          >
-            <NButton secondary size="small">
-              <template #icon>
-                <NIcon :component="ChevronDown" />
-              </template>
-              切换样式：{{ accountListViewLabel }}
+          <div class="list-main-controls">
+            <NDropdown
+              trigger="click"
+              :options="accountListViewOptions"
+              @select="handleAccountListViewSelect"
+            >
+              <NButton secondary size="small">
+                <template #icon>
+                  <NIcon :component="ChevronDown" />
+                </template>
+                切换样式：{{ accountListViewLabel }}
+              </NButton>
+            </NDropdown>
+            <NButton
+              secondary
+              size="small"
+              :type="refreshSelectMode ? 'primary' : 'default'"
+              @click="toggleRefreshSelectMode"
+            >
+              多选刷新
             </NButton>
-          </NDropdown>
+            <template v-if="refreshSelectMode">
+              <NTag size="small" type="info" :bordered="false">
+                {{ selectedRefreshCount }} 已选
+              </NTag>
+              <NButton
+                secondary
+                size="small"
+                :disabled="filteredAccountNames.length === 0 || isBulkRefreshing"
+                @click="selectAllFilteredRefreshAccounts"
+              >
+                全选当前筛选
+              </NButton>
+              <NButton
+                secondary
+                type="primary"
+                size="small"
+                :disabled="!canRefreshSelected"
+                :loading="isBulkRefreshing"
+                @click="refreshSelectedAccounts"
+              >
+                刷新已选
+              </NButton>
+              <NButton secondary size="small" :disabled="isBulkRefreshing" @click="exitRefreshSelectMode">
+                退出选择
+              </NButton>
+            </template>
+          </div>
           <div class="sort-control-row" aria-label="账号排序">
             <span class="sort-control-label">排序</span>
             <NDropdown trigger="click" :options="quotaSortOptions" @select="handleQuotaSortSelect">
@@ -1357,6 +1616,7 @@ onMounted(loadAccounts)
             :columns="disabledColumns"
             :data="visibleDisabledAccounts"
             :row-key="accountRowKey"
+            :row-props="accountTableRowProps"
             :checked-row-keys="selectedDisabledAccountKeys"
             :pagination="false"
             v-bind="disabledTableDisplayProps"
@@ -1385,6 +1645,8 @@ onMounted(loadAccounts)
             :loading="tableLoading"
             :columns="normalColumns"
             :data="visibleNormalAccounts"
+            :row-key="accountRowKey"
+            :row-props="accountTableRowProps"
             :pagination="false"
             v-bind="normalTableDisplayProps"
             table-layout="fixed"
@@ -1424,9 +1686,16 @@ onMounted(loadAccounts)
                 'is-disabled': account.disabled,
                 'is-enabled': !account.disabled,
                 'has-error': hasAccountError(account),
+                'is-select-mode': refreshSelectMode,
+                'is-selected': isRefreshAccountSelected(account),
               }"
-              :aria-label="`查看 ${account.email ?? account.name} 详情`"
-              @click="openDetail(account)"
+              :aria-label="
+                refreshSelectMode
+                  ? `选择 ${account.email ?? account.name}`
+                  : `查看 ${account.email ?? account.name} 详情`
+              "
+              :aria-pressed="refreshSelectMode ? isRefreshAccountSelected(account) : undefined"
+              @click="handleAccountCardClick(account)"
             >
               <div class="account-card-top">
                 <div class="account-card-identity">
@@ -1563,70 +1832,92 @@ onMounted(loadAccounts)
         </NDescriptions>
         <div v-if="selectedAccount" class="detail-action-row">
           <NSpace :size="8" wrap>
-            <NPopconfirm
-              v-if="selectedAccount.disabled"
-              @positive-click="enableAccount(selectedAccount)"
+            <NButton
+              size="small"
+              type="primary"
+              secondary
+              :disabled="isRowActing(selectedAccount) || isBulkDeleting || isBulkRefreshing"
+              :loading="isActionLoading(selectedAccount, 'refresh')"
+              @click="refreshAccount(selectedAccount, { closeDetail: true })"
             >
-              <template #trigger>
-                <NButton
-                  size="small"
-                  type="primary"
-                  secondary
-                  :disabled="isRowActing(selectedAccount) || isBulkDeleting"
-                  :loading="isActionLoading(selectedAccount, 'toggle')"
-                >
-                  启用
-                </NButton>
-              </template>
-              启用 {{ selectedAccount.name }}？
-            </NPopconfirm>
-            <NPopconfirm v-else @positive-click="disableAccount(selectedAccount)">
-              <template #trigger>
-                <NButton
-                  size="small"
-                  type="warning"
-                  secondary
-                  :disabled="isRowActing(selectedAccount) || isBulkDeleting"
-                  :loading="isActionLoading(selectedAccount, 'toggle')"
-                >
-                  禁用
-                </NButton>
-              </template>
-              禁用 {{ selectedAccount.name }}？
-            </NPopconfirm>
+              刷新
+            </NButton>
+            <NButton
+              v-if="selectedAccount.disabled"
+              size="small"
+              type="primary"
+              secondary
+              :disabled="isRowActing(selectedAccount) || isBulkDeleting || isBulkRefreshing"
+              :loading="isActionLoading(selectedAccount, 'toggle')"
+              @click="confirmEnableAccount(selectedAccount)"
+            >
+              启用
+            </NButton>
+            <NButton
+              v-else
+              size="small"
+              type="warning"
+              secondary
+              :disabled="isRowActing(selectedAccount) || isBulkDeleting || isBulkRefreshing"
+              :loading="isActionLoading(selectedAccount, 'toggle')"
+              @click="confirmDisableAccount(selectedAccount)"
+            >
+              禁用
+            </NButton>
             <NButton
               size="small"
               secondary
-              :disabled="isRowActing(selectedAccount) || isBulkDeleting"
+              :disabled="isRowActing(selectedAccount) || isBulkDeleting || isBulkRefreshing"
               :loading="isActionLoading(selectedAccount, 'priority')"
               @click="openPriorityDialog(selectedAccount)"
             >
               修改优先级
             </NButton>
-            <NPopconfirm
+            <NButton
               v-if="selectedAccount.disabled"
-              :disabled="isBulkDeleting"
-              @positive-click="deleteAccount(selectedAccount)"
+              size="small"
+              type="error"
+              secondary
+              :disabled="isRowActing(selectedAccount) || isBulkDeleting || isBulkRefreshing"
+              :loading="isActionLoading(selectedAccount, 'delete')"
+              @click="confirmDeleteAccount(selectedAccount)"
             >
-              <template #trigger>
-                <NButton
-                  size="small"
-                  type="error"
-                  secondary
-                  :disabled="isRowActing(selectedAccount) || isBulkDeleting"
-                  :loading="isActionLoading(selectedAccount, 'delete')"
-                >
-                  删除
-                </NButton>
-              </template>
-              删除 {{ selectedAccount.name }}？此操作会从 CPA 删除 auth file。
-            </NPopconfirm>
+              删除
+            </NButton>
           </NSpace>
         </div>
       </NDrawerContent>
     </NDrawer>
 
-    <NModal v-model:show="bulkDeleteDialog.show" preset="dialog" title="批量删除已禁用账号">
+    <NModal
+      v-model:show="accountConfirmDialog.show"
+      preset="dialog"
+      :title="accountConfirmDialog.title"
+      :style="{ width: 'min(420px, calc(100vw - 32px))' }"
+    >
+      <p class="account-confirm-content">{{ accountConfirmDialog.content }}</p>
+      <template #action>
+        <NSpace justify="end">
+          <NButton :disabled="isAccountConfirmSubmitting" @click="accountConfirmDialog.show = false">
+            取消
+          </NButton>
+          <NButton
+            :type="accountConfirmDialog.type"
+            :loading="isAccountConfirmSubmitting"
+            @click="submitAccountConfirm"
+          >
+            {{ accountConfirmDialog.positiveText }}
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <NModal
+      v-model:show="bulkDeleteDialog.show"
+      preset="dialog"
+      title="批量删除已禁用账号"
+      :style="{ width: 'min(460px, calc(100vw - 32px))' }"
+    >
       <div class="bulk-delete-dialog">
         <p class="bulk-delete-warning">
           将删除已选 {{ selectedDisabledCount }} 个已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。
@@ -1651,7 +1942,12 @@ onMounted(loadAccounts)
       </template>
     </NModal>
 
-    <NModal v-model:show="priorityDialog.show" preset="dialog" :title="priorityDialogTitle">
+    <NModal
+      v-model:show="priorityDialog.show"
+      preset="dialog"
+      :title="priorityDialogTitle"
+      :style="{ width: 'min(460px, calc(100vw - 32px))' }"
+    >
       <div class="priority-dialog">
         <NSelect
           :value="priorityDialog.mode"
@@ -1810,6 +2106,14 @@ onMounted(loadAccounts)
   min-width: 0;
 }
 
+.list-main-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .sort-control-row {
   display: flex;
   flex-wrap: wrap;
@@ -1943,6 +2247,19 @@ onMounted(loadAccounts)
 .account-card:hover {
   border-color: color-mix(in srgb, var(--cpa-primary) 36%, var(--cpa-border));
   transform: translateY(-1px);
+}
+
+.account-card.is-select-mode {
+  background: color-mix(in srgb, var(--cpa-primary) 5%, var(--cpa-surface-raised));
+}
+
+.account-card.is-selected {
+  background: color-mix(in srgb, var(--cpa-primary) 12%, var(--cpa-surface-raised));
+  border-color: color-mix(in srgb, var(--cpa-primary) 64%, var(--cpa-border));
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--cpa-primary) 14%, transparent),
+    var(--cpa-shadow-card),
+    var(--cpa-shadow-hairline);
 }
 
 .account-card:focus-visible {
@@ -2226,6 +2543,18 @@ onMounted(loadAccounts)
   vertical-align: middle;
 }
 
+.account-table :deep(.n-data-table-tr.is-refresh-selectable) {
+  cursor: pointer;
+}
+
+.account-table :deep(.n-data-table-tr.is-refresh-selected .n-data-table-td) {
+  background: color-mix(in srgb, var(--cpa-primary) 12%, var(--cpa-surface-raised));
+}
+
+.account-table :deep(.n-data-table-tr.is-refresh-selected:hover .n-data-table-td) {
+  background: color-mix(in srgb, var(--cpa-primary) 16%, var(--cpa-surface-raised));
+}
+
 :global(.quota-window-cell) {
   display: grid;
   gap: 8px;
@@ -2331,6 +2660,14 @@ onMounted(loadAccounts)
   gap: 8px;
 }
 
+.account-confirm-content {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--cpa-text);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .bulk-delete-warning,
 .priority-hint {
   margin: 0;
@@ -2370,6 +2707,7 @@ onMounted(loadAccounts)
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .list-main-controls,
   .list-control-row,
   .sort-control-row {
     justify-content: flex-start;
@@ -2402,6 +2740,10 @@ onMounted(loadAccounts)
   }
 
   .sort-control-row {
+    width: 100%;
+  }
+
+  .list-main-controls {
     width: 100%;
   }
 

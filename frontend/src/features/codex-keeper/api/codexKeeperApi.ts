@@ -5,6 +5,7 @@ import type {
   CodexKeeperCronPreviewPayload,
   CodexKeeperCronPreviewResponse,
   CodexKeeperAccountsResponse,
+  CodexKeeperRefreshPayload,
   CodexKeeperSettings,
   CodexKeeperSettingsUpdatePayload,
   CodexKeeperStatus,
@@ -69,6 +70,10 @@ export function bulkDeleteCodexKeeperAccounts(
     '/codex-keeper/accounts/bulk-delete',
     payload,
   )
+}
+
+export function refreshCodexKeeperAccounts(payload: CodexKeeperRefreshPayload): Promise<void> {
+  return apiClient.post<void>('/codex-keeper/accounts/refresh', payload)
 }
 
 export function updateCodexKeeperPriority(authName: string, priority: number): Promise<void> {

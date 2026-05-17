@@ -152,6 +152,10 @@ export interface CodexKeeperBulkDeletePayload {
   auth_names: string[]
 }
 
+export interface CodexKeeperRefreshPayload {
+  auth_names: string[]
+}
+
 export interface CodexKeeperBulkDeleteFailure {
   name: string
   message: string
