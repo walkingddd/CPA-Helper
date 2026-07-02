@@ -21,6 +21,7 @@ import {
   BarChart3,
   Cpu,
   DollarSign,
+  Gauge,
   Github,
   KeyRound,
   Languages,
@@ -133,6 +134,7 @@ const accountInspectionMenuItems = computed<MenuOption[]>(() => [
     key: '/admin/account-inspection',
     icon: renderIcon(Activity),
   },
+  { label: t('额度分配', 'Account Allocations'), key: '/admin/account-allocations', icon: renderIcon(Gauge) },
   { label: t('账号状态', 'Account Status'), key: '/admin/account-status', icon: renderIcon(ListChecks) },
 ])
 

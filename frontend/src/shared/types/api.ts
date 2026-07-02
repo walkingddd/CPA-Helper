@@ -312,6 +312,118 @@ export interface CodexKeeperBulkDeleteResponse {
   failed: CodexKeeperBulkDeleteFailure[]
 }
 
+export type AccountAllocationScopeType = 'auth' | 'pool'
+export type AccountAllocationQuotaType = 'requests' | 'tokens' | 'usd'
+export type AccountAllocationPeriod = 'daily' | 'monthly' | 'all_time'
+export type AccountAllocationWarningLevel = 'ok' | 'warning' | 'over_quota' | 'disabled'
+
+export interface AccountAllocationAccount {
+  auth_name: string
+  email: string | null
+  account_type: string | null
+  disabled: boolean
+}
+
+export interface AccountPoolMember {
+  auth_name: string
+  weight: number
+  account: AccountAllocationAccount | null
+  created_at: string
+}
+
+export interface AccountPool {
+  id: number
+  name: string
+  description: string
+  members: AccountPoolMember[]
+  created_at: string
+  updated_at: string
+}
+
+export interface AccountPoolPayload {
+  name: string
+  description: string
+}
+
+export interface AccountPoolMembersPayload {
+  auth_names?: string[]
+  members?: Array<{
+    auth_name: string
+    weight: number
+  }>
+}
+
+export interface UserAccountAllocation {
+  id: number
+  user_id: number
+  username: string
+  user_label: string
+  scope_type: AccountAllocationScopeType
+  auth_name: string | null
+  pool_id: number | null
+  pool_name: string | null
+  quota_type: AccountAllocationQuotaType
+  quota_limit: number
+  period: AccountAllocationPeriod
+  hard_limit: boolean
+  enabled: boolean
+  note: string
+  created_at: string
+  updated_at: string
+}
+
+export interface UserAccountAllocationPayload {
+  user_id: number
+  scope_type: AccountAllocationScopeType
+  auth_name?: string | null
+  pool_id?: number | null
+  quota_type: AccountAllocationQuotaType
+  quota_limit: number
+  period: AccountAllocationPeriod
+  hard_limit: boolean
+  enabled: boolean
+  note: string
+}
+
+export interface AccountAllocationUserOption {
+  id: number
+  username: string
+  label: string
+  disabled: boolean
+}
+
+export interface AccountAllocationUsage {
+  allocation: UserAccountAllocation
+  period_key: string
+  window_start: string | null
+  window_end: string | null
+  records: number
+  failed_records: number
+  total_tokens: number
+  estimated_cost_usd: number
+  unpriced_records: number
+  used_value: number
+  quota_limit: number
+  remaining: number
+  used_percent: number
+  over_quota: boolean
+  warning_level: AccountAllocationWarningLevel
+  last_alert_at: string | null
+  matched_auth_names: string[]
+}
+
+export interface AccountAllocationsOverview {
+  accounts: AccountAllocationAccount[]
+  pools: AccountPool[]
+  allocations: UserAccountAllocation[]
+  usage: AccountAllocationUsage[]
+  users: AccountAllocationUserOption[]
+  enforcement: {
+    mode: string
+    message: string
+  }
+}
+
 export interface UsageFilters {
   scope?: 'admin' | 'account' | undefined
   start?: string | undefined

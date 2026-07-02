@@ -74,6 +74,12 @@ export const router = createRouter({
           meta: { requiresAdmin: true },
         },
         {
+          path: 'admin/account-allocations',
+          name: 'admin-account-allocations',
+          component: () => import('@/features/account-allocations/views/AccountAllocationsView.vue'),
+          meta: { requiresAdmin: true },
+        },
+        {
           path: 'admin/pricing',
           name: 'admin-pricing',
           component: () => import('@/features/pricing/views/ModelPricesView.vue'),

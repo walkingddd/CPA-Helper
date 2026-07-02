@@ -78,6 +78,18 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testTableExists(t, app.db, "user_card_shop_tags") {
 		t.Fatal("user_card_shop_tags was not created")
 	}
+	if !testTableExists(t, app.db, "account_pools") {
+		t.Fatal("account_pools was not created")
+	}
+	if !testTableExists(t, app.db, "account_pool_members") {
+		t.Fatal("account_pool_members was not created")
+	}
+	if !testTableExists(t, app.db, "user_account_allocations") {
+		t.Fatal("user_account_allocations was not created")
+	}
+	if !testTableExists(t, app.db, "allocation_alert_states") {
+		t.Fatal("allocation_alert_states was not created")
+	}
 	if !testColumnExists(t, app.db, "user_quota_charges", "lifetime_deducted_usd") {
 		t.Fatal("user_quota_charges.lifetime_deducted_usd was not created")
 	}
@@ -89,6 +101,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if !testColumnExists(t, app.db, "user_card_shop_tags", "position") {
 		t.Fatal("user_card_shop_tags.position was not created")
+	}
+	if !testColumnExists(t, app.db, "user_account_allocations", "hard_limit") {
+		t.Fatal("user_account_allocations.hard_limit was not created")
 	}
 	if testColumnExists(t, app.db, "user_quota_charges", "total_deducted_usd") {
 		t.Fatal("old user_quota_charges.total_deducted_usd should not exist")
