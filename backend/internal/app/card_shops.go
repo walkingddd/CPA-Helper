@@ -160,6 +160,7 @@ func fetchCardShops(ctx context.Context) ([]map[string]any, error) {
 	if shops == nil {
 		shops = []map[string]any{}
 	}
+	normalizeCardShopProductItems(shops)
 	return shops, nil
 }
 
@@ -168,6 +169,98 @@ func cardShopsSourceURL() string {
 		return value
 	}
 	return defaultCardShopsURL
+}
+
+func normalizeCardShopProductItems(shops []map[string]any) {
+	for _, shop := range shops {
+		if lenCardShopItems(shop["productItems"]) > 0 {
+			continue
+		}
+		if previewItems := cardShopSummaryPreviewItems(shop); len(previewItems) > 0 {
+			shop["productItems"] = previewItems
+		}
+	}
+}
+
+func lenCardShopItems(value any) int {
+	switch items := value.(type) {
+	case []any:
+		return len(items)
+	case []map[string]any:
+		return len(items)
+	default:
+		return 0
+	}
+}
+
+func cardShopSummaryPreviewItems(shop map[string]any) []map[string]any {
+	summary, ok := shop["productSummary"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	groups, ok := summary["groups"].([]any)
+	if !ok {
+		return nil
+	}
+
+	items := []map[string]any{}
+	seen := map[string]struct{}{}
+	for _, groupValue := range groups {
+		group, ok := groupValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		groupName := cardShopStringField(group, "group")
+		previewItems, ok := group["previewItems"].([]any)
+		if !ok {
+			continue
+		}
+		for _, previewValue := range previewItems {
+			preview, ok := previewValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			item := copyCardShopMap(preview)
+			if groupName != "" && cardShopStringField(item, "group") == "" {
+				item["group"] = groupName
+			}
+			key := cardShopProductKey(item, groupName)
+			if key != "" {
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+			}
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func copyCardShopMap(source map[string]any) map[string]any {
+	target := make(map[string]any, len(source)+1)
+	for key, value := range source {
+		target[key] = value
+	}
+	return target
+}
+
+func cardShopStringField(source map[string]any, key string) string {
+	value, ok := source[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func cardShopProductKey(item map[string]any, groupName string) string {
+	if itemURL := cardShopStringField(item, "itemUrl"); itemURL != "" {
+		return "url:" + itemURL
+	}
+	if name := cardShopStringField(item, "name"); name != "" {
+		return "name:" + groupName + ":" + name
+	}
+	return ""
 }
 
 func normalizeCardShopFavoriteKey(value string) (string, error) {

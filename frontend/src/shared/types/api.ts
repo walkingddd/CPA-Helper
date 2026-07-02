@@ -90,12 +90,23 @@ export interface CollectorStatus {
 
 export interface CardShopProductItem {
   name?: string | null
-  price?: number | null
-  stockCount?: number | null
-  salesCount?: number | null
+  price?: number | string | null
+  stockCount?: number | string | null
+  salesCount?: number | string | null
   itemUrl?: string | null
   category?: string | null
   group?: string | null
+}
+
+export interface CardShopProductSummaryGroup {
+  group?: string | null
+  previewItems?: CardShopProductItem[] | null
+}
+
+export interface CardShopProductSummary {
+  totalCount?: number | string | null
+  bestScore?: CardShopProductItem | null
+  groups?: CardShopProductSummaryGroup[] | null
 }
 
 export interface CardShop {
@@ -103,9 +114,10 @@ export interface CardShop {
   shopName?: string | null
   shopUrl?: string | null
   telegram?: string | null
-  shopSellCount?: number | null
+  shopSellCount?: number | string | null
   productsInStock?: string[] | null
   productItems?: CardShopProductItem[] | null
+  productSummary?: CardShopProductSummary | null
   notes?: string | null
   updatedAt?: string | null
 }

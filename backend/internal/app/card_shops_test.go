@@ -90,6 +90,74 @@ func TestCardShopsProxyReturnsUpstreamShopsForAdmin(t *testing.T) {
 	}
 }
 
+func TestCardShopsProxyFlattensProductSummaryPreviewItems(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"shops": []map[string]any{
+				{
+					"id":              "summary-shop",
+					"shopName":        "Summary shop",
+					"productsInStock": []string{"GPT Plus"},
+					"productItems":    []map[string]any{},
+					"productSummary": map[string]any{
+						"groups": []map[string]any{
+							{
+								"group": "GPT/Codex",
+								"previewItems": []map[string]any{
+									{
+										"name":       "GPT Plus",
+										"price":      32.8,
+										"stockCount": 25,
+										"itemUrl":    "https://pay.ldxp.cn/item/summary",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+	t.Setenv("CPA_HELPER_CARD_SHOPS_URL", upstream.URL)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+
+	var response struct {
+		Shops []struct {
+			ProductItems []struct {
+				Name       string  `json:"name"`
+				Price      float64 `json:"price"`
+				StockCount int     `json:"stockCount"`
+				Group      string  `json:"group"`
+				ItemURL    string  `json:"itemUrl"`
+			} `json:"productItems"`
+		} `json:"shops"`
+	}
+	requestJSON(t, handler, http.MethodGet, "/api/card-shops", nil, cookies, &response)
+
+	if len(response.Shops) != 1 || len(response.Shops[0].ProductItems) != 1 {
+		t.Fatalf("productItems = %#v, want flattened preview item", response.Shops)
+	}
+	if got := response.Shops[0].ProductItems[0]; got.Name != "GPT Plus" || got.Price != 32.8 || got.StockCount != 25 || got.Group != "GPT/Codex" {
+		t.Fatalf("flattened product item = %#v, want preview item with group and price", got)
+	}
+}
+
 func TestCardShopsProxyRequiresAdmin(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	upstreamCalls := 0

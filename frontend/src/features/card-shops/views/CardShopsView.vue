@@ -599,8 +599,19 @@ function displayText(value: string | null | undefined): string {
   return textValue(value) || DEFAULT_EMPTY_TEXT
 }
 
-function numberValue(value: number | null | undefined): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
+function numberValue(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null
+  }
+  if (typeof value !== 'string') {
+    return null
+  }
+  const match = value.trim().replace(/,/g, '').match(/-?\d+(?:\.\d+)?/)
+  if (!match) {
+    return null
+  }
+  const parsed = Number(match[0])
+  return Number.isFinite(parsed) ? parsed : null
 }
 
 function shopProducts(shop: CardShop): CardShopProductItem[] {
@@ -608,8 +619,38 @@ function shopProducts(shop: CardShop): CardShopProductItem[] {
   if (productItems.length > 0) {
     return productItems
   }
+  const summaryProducts = productSummaryProducts(shop)
+  if (summaryProducts.length > 0) {
+    return summaryProducts
+  }
   const names = Array.isArray(shop.productsInStock) ? shop.productsInStock : []
   return names.map((name) => ({ name }))
+}
+
+function productSummaryProducts(shop: CardShop): CardShopProductItem[] {
+  const groups = Array.isArray(shop.productSummary?.groups) ? shop.productSummary.groups : []
+  const products: CardShopProductItem[] = []
+  const seen = new Set<string>()
+  for (const group of groups) {
+    const groupName = textValue(group.group)
+    const previewItems = Array.isArray(group.previewItems) ? group.previewItems : []
+    for (const item of previewItems) {
+      const itemKey = textValue(item.itemUrl) || `${groupName}:${textValue(item.name)}`
+      if (itemKey) {
+        if (seen.has(itemKey)) {
+          continue
+        }
+        seen.add(itemKey)
+      }
+      const product: CardShopProductItem = { ...item }
+      const productGroup = textValue(item.group) || groupName
+      if (productGroup) {
+        product.group = productGroup
+      }
+      products.push(product)
+    }
+  }
+  return products
 }
 
 function searchableProductTitleText(product: CardShopProductItem): string {
@@ -736,7 +777,7 @@ function compareShopNames(left: CardShopRow, right: CardShopRow): number {
   return displayText(left.shop.shopName).localeCompare(displayText(right.shop.shopName), currentLanguage.value)
 }
 
-function formatShopPrice(value: number | null | undefined): string {
+function formatShopPrice(value: unknown): string {
   const price = numberValue(value)
   if (price === null) {
     return DEFAULT_EMPTY_TEXT
@@ -748,7 +789,7 @@ function formatShopPrice(value: number | null | undefined): string {
   }).format(price)
 }
 
-function formatCount(value: number | null | undefined): string {
+function formatCount(value: unknown): string {
   const count = numberValue(value)
   return count === null ? DEFAULT_EMPTY_TEXT : formatInteger(count)
 }
