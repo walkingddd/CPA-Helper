@@ -268,6 +268,39 @@ export interface CodexKeeperRefreshPayload {
   auth_names: string[]
 }
 
+export type CodexKeeperOAuthProvider = 'codex' | 'anthropic' | 'gemini' | 'antigravity' | 'kimi'
+
+export interface CodexKeeperOAuthStartPayload {
+  provider: CodexKeeperOAuthProvider
+  project_id?: string | undefined
+}
+
+export interface CodexKeeperOAuthStartResponse {
+  provider: CodexKeeperOAuthProvider
+  label: string
+  url: string
+  state: string
+  status: string
+}
+
+export interface CodexKeeperOAuthStatusResponse {
+  state: string
+  status: string
+  completed: boolean
+  raw: Record<string, unknown>
+}
+
+export interface CodexKeeperOAuthCallbackPayload {
+  provider: CodexKeeperOAuthProvider
+  redirect_url: string
+}
+
+export interface CodexKeeperOAuthCallbackResponse {
+  provider: CodexKeeperOAuthProvider
+  status: string
+  raw: Record<string, unknown>
+}
+
 export interface CodexKeeperBulkDeleteFailure {
   name: string
   message: string

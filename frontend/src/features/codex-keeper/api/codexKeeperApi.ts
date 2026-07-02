@@ -5,6 +5,11 @@ import type {
   CodexKeeperCronPreviewPayload,
   CodexKeeperCronPreviewResponse,
   CodexKeeperAccountsResponse,
+  CodexKeeperOAuthCallbackPayload,
+  CodexKeeperOAuthCallbackResponse,
+  CodexKeeperOAuthStartPayload,
+  CodexKeeperOAuthStartResponse,
+  CodexKeeperOAuthStatusResponse,
   CodexKeeperRefreshPayload,
   CodexKeeperSettings,
   CodexKeeperSettingsUpdatePayload,
@@ -49,6 +54,22 @@ export function stopCodexKeeper(): Promise<void> {
 
 export function clearCodexKeeperLogs(): Promise<void> {
   return apiClient.post<void>('/codex-keeper/logs/clear')
+}
+
+export function startCodexKeeperOAuth(
+  payload: CodexKeeperOAuthStartPayload,
+): Promise<CodexKeeperOAuthStartResponse> {
+  return apiClient.post<CodexKeeperOAuthStartResponse>('/codex-keeper/oauth/start', payload)
+}
+
+export function getCodexKeeperOAuthStatus(state: string): Promise<CodexKeeperOAuthStatusResponse> {
+  return apiClient.get<CodexKeeperOAuthStatusResponse>('/codex-keeper/oauth/status', { state })
+}
+
+export function submitCodexKeeperOAuthCallback(
+  payload: CodexKeeperOAuthCallbackPayload,
+): Promise<CodexKeeperOAuthCallbackResponse> {
+  return apiClient.post<CodexKeeperOAuthCallbackResponse>('/codex-keeper/oauth/callback', payload)
 }
 
 export function enableCodexKeeperAccount(authName: string): Promise<void> {

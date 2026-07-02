@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
+  NAlert,
   NButton,
   NDataTable,
   NForm,
@@ -18,7 +19,9 @@ import {
 import {
   Activity,
   Copy,
+  ExternalLink,
   Gauge,
+  LogIn,
   PauseCircle,
   ShieldAlert,
   ShieldCheck,
@@ -29,16 +32,20 @@ import {
 import {
   clearCodexKeeperLogs,
   getCodexKeeperSettings,
+  getCodexKeeperOAuthStatus,
   getCodexKeeperStatus,
   listCodexKeeperAccounts,
   previewCodexKeeperSchedule,
   runCodexKeeperOnce,
   startCodexKeeper,
+  startCodexKeeperOAuth,
   stopCodexKeeper,
+  submitCodexKeeperOAuthCallback,
   updateCodexKeeperSettings,
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type {
   CodexKeeperAccount,
+  CodexKeeperOAuthProvider,
   CodexKeeperPriorityRule,
   CodexKeeperSettingsUpdatePayload,
   CodexKeeperStatus,
@@ -73,6 +80,24 @@ const logBodyRef = ref<HTMLElement | null>(null)
 const shouldFollowLatestLog = ref(true)
 let statusTimer: number | undefined
 let schedulePreviewTimer: number | undefined
+let oauthStatusTimer: number | undefined
+
+const oauthProviderOptions: Array<{ label: string; value: CodexKeeperOAuthProvider }> = [
+  { label: 'Codex / OpenAI', value: 'codex' },
+  { label: 'Claude', value: 'anthropic' },
+  { label: 'Gemini CLI', value: 'gemini' },
+  { label: 'Antigravity', value: 'antigravity' },
+  { label: 'Kimi', value: 'kimi' },
+]
+
+const oauthProvider = ref<CodexKeeperOAuthProvider>('codex')
+const oauthProjectID = ref('')
+const oauthCallbackURL = ref('')
+const oauthFlow = ref<Awaited<ReturnType<typeof startCodexKeeperOAuth>> | null>(null)
+const oauthStatus = ref<Awaited<ReturnType<typeof getCodexKeeperOAuthStatus>> | null>(null)
+const isStartingOAuth = ref(false)
+const isCheckingOAuth = ref(false)
+const isSubmittingOAuthCallback = ref(false)
 
 const conditionalRefreshIntervalOptions = computed(() => [
   { label: t('关闭', 'Off'), value: 0 },
@@ -157,6 +182,20 @@ const statusDetailText = computed(() => {
 const statusFootnoteText = computed(() =>
   isDaemonRunning.value ? t('等待 Cron 调度', 'Waiting for Cron schedule') : t('后台自动巡检', 'Background automatic inspection'),
 )
+
+const oauthProviderNeedsProjectID = computed(() => oauthProvider.value === 'gemini')
+const oauthStatusText = computed(() => {
+  if (oauthStatus.value?.completed) {
+    return t('OAuth 登录已完成，auth file 已由 CLIProxyAPI 写入。', 'OAuth sign-in is complete. CLIProxyAPI has written the auth file.')
+  }
+  if (oauthStatus.value?.status) {
+    return t(`当前状态：${oauthStatus.value.status}`, `Current status: ${oauthStatus.value.status}`)
+  }
+  if (oauthFlow.value?.state) {
+    return t('等待浏览器完成授权。', 'Waiting for browser authorization.')
+  }
+  return ''
+})
 
 watch(logText, () => {
   if (shouldFollowLatestLog.value) {
@@ -300,6 +339,111 @@ async function runAction(action: () => Promise<void>, successText: string) {
     message.error(errorText(error, '操作失败', 'Operation failed'))
   } finally {
     isActing.value = false
+  }
+}
+
+async function startOAuthLogin() {
+  isStartingOAuth.value = true
+  oauthStatus.value = null
+  try {
+    const payload = {
+      provider: oauthProvider.value,
+      project_id: oauthProviderNeedsProjectID.value ? oauthProjectID.value.trim() : undefined,
+    }
+    const flow = await startCodexKeeperOAuth(payload)
+    oauthFlow.value = flow
+    oauthCallbackURL.value = ''
+    const popup = window.open(flow.url, '_blank', 'noopener,noreferrer')
+    if (!popup) {
+      message.info(t('OAuth 链接已生成，请手动打开授权页。', 'OAuth link generated. Open the authorization page manually.'))
+    } else {
+      message.success(t('已打开 OAuth 授权页', 'OAuth authorization page opened'))
+    }
+    startOAuthStatusPolling()
+  } catch (error) {
+    message.error(errorText(error, '创建 OAuth 登录失败', 'Failed to create OAuth sign-in'))
+  } finally {
+    isStartingOAuth.value = false
+  }
+}
+
+function openOAuthURL() {
+  if (!oauthFlow.value?.url) {
+    return
+  }
+  window.open(oauthFlow.value.url, '_blank', 'noopener,noreferrer')
+}
+
+function startOAuthStatusPolling() {
+  stopOAuthStatusPolling()
+  if (!oauthFlow.value?.state) {
+    return
+  }
+  void checkOAuthStatus({ silent: true })
+  oauthStatusTimer = window.setInterval(() => {
+    void checkOAuthStatus({ silent: true })
+  }, 3000)
+}
+
+function stopOAuthStatusPolling() {
+  if (oauthStatusTimer !== undefined) {
+    window.clearInterval(oauthStatusTimer)
+    oauthStatusTimer = undefined
+  }
+}
+
+async function checkOAuthStatus(options: { silent?: boolean } = {}) {
+  const state = oauthFlow.value?.state
+  if (!state) {
+    if (!options.silent) {
+      message.info(t('当前没有可查询的 OAuth state', 'There is no OAuth state to check yet'))
+    }
+    return
+  }
+  isCheckingOAuth.value = true
+  try {
+    const nextStatus = await getCodexKeeperOAuthStatus(state)
+    oauthStatus.value = nextStatus
+    if (nextStatus.completed) {
+      stopOAuthStatusPolling()
+      await loadStatus()
+      message.success(t('OAuth 登录已完成', 'OAuth sign-in completed'))
+    } else if (!options.silent) {
+      message.info(oauthStatusText.value || t('OAuth 登录仍在等待完成', 'OAuth sign-in is still pending'))
+    }
+  } catch (error) {
+    if (!options.silent) {
+      message.error(errorText(error, '查询 OAuth 状态失败', 'Failed to check OAuth status'))
+    }
+  } finally {
+    isCheckingOAuth.value = false
+  }
+}
+
+async function submitOAuthCallback() {
+  if (!oauthCallbackURL.value.trim()) {
+    message.error(t('请粘贴 OAuth callback URL', 'Paste the OAuth callback URL'))
+    return
+  }
+  isSubmittingOAuthCallback.value = true
+  try {
+    const result = await submitCodexKeeperOAuthCallback({
+      provider: oauthFlow.value?.provider ?? oauthProvider.value,
+      redirect_url: oauthCallbackURL.value.trim(),
+    })
+    oauthStatus.value = {
+      state: oauthFlow.value?.state ?? '',
+      status: result.status || 'ok',
+      completed: true,
+      raw: result.raw,
+    }
+    stopOAuthStatusPolling()
+    await loadStatus()
+    message.success(t('OAuth callback 已提交', 'OAuth callback submitted'))
+  } catch (error) {
+    message.error(errorText(error, '提交 OAuth callback 失败', 'Failed to submit OAuth callback'))
+  } finally {
+    isSubmittingOAuthCallback.value = false
   }
 }
 
@@ -503,6 +647,7 @@ onBeforeUnmount(() => {
   if (schedulePreviewTimer !== undefined) {
     window.clearTimeout(schedulePreviewTimer)
   }
+  stopOAuthStatusPolling()
 })
 </script>
 
@@ -575,6 +720,64 @@ onBeforeUnmount(() => {
         <div class="metric-footnote">{{ t('临时降级', 'Temporary downgrade') }}</div>
       </div>
     </div>
+
+    <section class="panel oauth-panel">
+      <div class="panel-inner oauth-panel-inner">
+        <div class="section-heading">
+          <div>
+            <h2 class="section-title">{{ t('OAuth 登录', 'OAuth Sign-in') }}</h2>
+            <p class="section-hint">{{ t('通过 CLIProxyAPI 创建 provider 授权链接，完成后会写入新的 auth file。', 'Create a provider authorization link through CLIProxyAPI. The completed flow writes a new auth file.') }}</p>
+          </div>
+          <NSpace class="oauth-actions" size="small">
+            <NButton secondary :disabled="!oauthFlow?.url" @click="openOAuthURL">
+              <template #icon>
+                <NIcon :component="ExternalLink" />
+              </template>
+              {{ t('打开授权页', 'Open Auth Page') }}
+            </NButton>
+            <NButton secondary :loading="isCheckingOAuth" :disabled="!oauthFlow?.state" @click="checkOAuthStatus()">
+              {{ t('检查状态', 'Check Status') }}
+            </NButton>
+          </NSpace>
+        </div>
+
+        <div class="oauth-grid">
+          <NFormItem :label="t('Provider', 'Provider')">
+            <NSelect v-model:value="oauthProvider" :options="oauthProviderOptions" />
+          </NFormItem>
+          <NFormItem v-if="oauthProviderNeedsProjectID" :label="t('GCP Project ID', 'GCP Project ID')">
+            <NInput v-model:value="oauthProjectID" placeholder="my-gcp-project" />
+          </NFormItem>
+          <NFormItem class="oauth-submit-item">
+            <NButton type="primary" block :loading="isStartingOAuth" @click="startOAuthLogin">
+              <template #icon>
+                <NIcon :component="LogIn" />
+              </template>
+              {{ t('创建并打开 OAuth 登录', 'Create and Open OAuth Sign-in') }}
+            </NButton>
+          </NFormItem>
+        </div>
+
+        <NAlert v-if="oauthFlow" class="oauth-alert" type="info" :show-icon="false">
+          <div class="oauth-status-line">
+            <strong>{{ oauthFlow.label }}</strong>
+            <span v-if="oauthFlow.state">state: {{ oauthFlow.state }}</span>
+            <span v-if="oauthStatusText">{{ oauthStatusText }}</span>
+          </div>
+        </NAlert>
+
+        <div class="oauth-callback-row">
+          <NInput
+            v-model:value="oauthCallbackURL"
+            clearable
+            :placeholder="t('如果浏览器没有自动回调，可粘贴 callback URL', 'Paste the callback URL if the browser did not complete the redirect automatically')"
+          />
+          <NButton secondary :loading="isSubmittingOAuthCallback" @click="submitOAuthCallback">
+            {{ t('提交 callback', 'Submit Callback') }}
+          </NButton>
+        </div>
+      </div>
+    </section>
 
     <div class="grid-two inspection-settings-grid">
       <section class="panel inspection-config-panel">
@@ -865,6 +1068,64 @@ onBeforeUnmount(() => {
 
 .inspection-settings-grid {
   align-items: start;
+}
+
+.oauth-panel-inner {
+  display: grid;
+  gap: 10px;
+}
+
+.oauth-panel .section-heading {
+  margin-bottom: 0;
+}
+
+.oauth-actions {
+  flex-shrink: 0;
+}
+
+.oauth-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) minmax(220px, 1fr) minmax(220px, 260px);
+  gap: 10px;
+  align-items: end;
+}
+
+.oauth-grid :deep(.n-form-item) {
+  margin: 0;
+}
+
+.oauth-grid :deep(.n-form-item-feedback-wrapper) {
+  min-height: 0;
+}
+
+.oauth-submit-item {
+  align-self: end;
+}
+
+.oauth-alert {
+  border-radius: var(--cpa-radius-sm);
+}
+
+.oauth-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  align-items: center;
+  color: var(--cpa-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.oauth-status-line span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.oauth-callback-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
 }
 
 .config-panel-inner {
@@ -1307,6 +1568,8 @@ onBeforeUnmount(() => {
 
   .schedule-grid,
   .conditional-refresh-grid,
+  .oauth-grid,
+  .oauth-callback-row,
   .runtime-info-grid {
     grid-template-columns: 1fr;
   }

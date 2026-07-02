@@ -183,6 +183,108 @@ func TestKeeperSettingsExposeConditionalRefreshConfig(t *testing.T) {
 	}, cookies, http.StatusUnprocessableEntity)
 }
 
+func TestKeeperOAuthStartAndStatusProxyCLIProxyAPI(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	var sawAuthURL bool
+	var sawStatus bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" && r.Header.Get("X-Management-Key") == "" {
+			t.Fatalf("missing management auth headers")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v0/management/codex-auth-url":
+			sawAuthURL = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"url":    "https://auth.example.test/login",
+				"state":  "oauth-state-1",
+			})
+		case "/v0/management/get-auth-status":
+			sawStatus = true
+			if got := r.URL.Query().Get("state"); got != "oauth-state-1" {
+				t.Fatalf("state query = %q, want oauth-state-1", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "completed",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     upstream.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+
+	var startResponse struct {
+		Provider string `json:"provider"`
+		Label    string `json:"label"`
+		URL      string `json:"url"`
+		State    string `json:"state"`
+		Status   string `json:"status"`
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/oauth/start", map[string]any{
+		"provider": "codex",
+	}, cookies, &startResponse)
+	if !sawAuthURL {
+		t.Fatal("upstream auth-url route was not called")
+	}
+	if startResponse.Provider != "codex" || startResponse.URL != "https://auth.example.test/login" || startResponse.State != "oauth-state-1" {
+		t.Fatalf("start response = %#v, want codex login URL and state", startResponse)
+	}
+
+	var statusResponse struct {
+		State     string `json:"state"`
+		Status    string `json:"status"`
+		Completed bool   `json:"completed"`
+	}
+	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/oauth/status?state=oauth-state-1", nil, cookies, &statusResponse)
+	if !sawStatus {
+		t.Fatal("upstream auth status route was not called")
+	}
+	if statusResponse.State != "oauth-state-1" || statusResponse.Status != "completed" || !statusResponse.Completed {
+		t.Fatalf("status response = %#v, want completed status", statusResponse)
+	}
+}
+
+func TestKeeperOAuthRejectsInvalidProvider(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/oauth/start", map[string]any{
+		"provider": "unknown",
+	}, cookies, http.StatusUnprocessableEntity)
+}
+
 func TestKeeperLogsUseStandardFileFormatAndCanBeCleared(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)

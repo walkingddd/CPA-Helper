@@ -110,6 +110,24 @@ type keeperPriorityUpdateRequest struct {
 	Priority int `json:"priority"`
 }
 
+type keeperOAuthStartRequest struct {
+	Provider  string `json:"provider"`
+	ProjectID string `json:"project_id"`
+}
+
+type keeperOAuthCallbackRequest struct {
+	Provider    string `json:"provider"`
+	RedirectURL string `json:"redirect_url"`
+}
+
+type keeperOAuthProvider struct {
+	Key              string
+	Label            string
+	AuthURLPath      string
+	CallbackProvider string
+	AllowsProjectID  bool
+}
+
 type keeperAccount struct {
 	Name                   string     `json:"name"`
 	Email                  *string    `json:"email"`
@@ -935,6 +953,21 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		a.keeper.ClearLogs()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
 		return nil
+	case len(parts) == 2 && parts[0] == "oauth" && parts[1] == "start":
+		if err := requireMethod(r, http.MethodPost); err != nil {
+			return err
+		}
+		return a.startKeeperOAuth(w, r)
+	case len(parts) == 2 && parts[0] == "oauth" && parts[1] == "status":
+		if err := requireMethod(r, http.MethodGet); err != nil {
+			return err
+		}
+		return a.keeperOAuthStatus(w, r)
+	case len(parts) == 2 && parts[0] == "oauth" && parts[1] == "callback":
+		if err := requireMethod(r, http.MethodPost); err != nil {
+			return err
+		}
+		return a.submitKeeperOAuthCallback(w, r)
 	case len(parts) == 2 && parts[0] == "accounts" && parts[1] == "bulk-delete":
 		if err := requireMethod(r, http.MethodPost); err != nil {
 			return err
@@ -1025,6 +1058,216 @@ func keeperSettingsResponse(cfg AppConfig) map[string]any {
 		"enable_credential_websockets":         cfg.CodexKeeper.EnableCredentialWebsockets,
 		"auto_start_daemon":                    cfg.CodexKeeper.AutoStartDaemon,
 		"priority_rules":                       sortedPriorityRules(cfg.CodexKeeperPriorityRule),
+	}
+}
+
+func (a *App) startKeeperOAuth(w http.ResponseWriter, r *http.Request) error {
+	var payload keeperOAuthStartRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		return err
+	}
+	provider, err := normalizeKeeperOAuthProvider(payload.Provider)
+	if err != nil {
+		return err
+	}
+	cfg, err := a.loadConfig(r.Context())
+	if err != nil {
+		return err
+	}
+	if err := requireKeeperManagementConfig(cfg); err != nil {
+		return err
+	}
+
+	query := url.Values{}
+	projectID := strings.TrimSpace(payload.ProjectID)
+	if projectID != "" {
+		if !provider.AllowsProjectID {
+			return validationError("当前 OAuth provider 不支持 project_id")
+		}
+		query.Set("project_id", projectID)
+	}
+
+	_, responsePayload, err := a.keeperRequest(r.Context(), cfg, http.MethodGet, provider.AuthURLPath, query, nil, time.Duration(cfg.CodexKeeper.CPATimeoutSeconds)*time.Second)
+	if err != nil {
+		return err
+	}
+	response, err := parseKeeperOAuthObject(responsePayload, "创建 OAuth 登录 URL")
+	if err != nil {
+		return err
+	}
+	loginURL := firstKeeperOAuthString(response, "url", "auth_url", "authUrl", "login_url", "loginUrl")
+	if loginURL == "" {
+		return validationError("CLIProxyAPI OAuth 响应缺少登录 URL")
+	}
+	state := firstKeeperOAuthString(response, "state")
+	status := firstKeeperOAuthString(response, "status")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider": provider.Key,
+		"label":    provider.Label,
+		"url":      loginURL,
+		"state":    state,
+		"status":   status,
+	})
+	return nil
+}
+
+func (a *App) keeperOAuthStatus(w http.ResponseWriter, r *http.Request) error {
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	if state == "" {
+		return validationError("OAuth state 不能为空")
+	}
+	cfg, err := a.loadConfig(r.Context())
+	if err != nil {
+		return err
+	}
+	if err := requireKeeperManagementConfig(cfg); err != nil {
+		return err
+	}
+	query := url.Values{"state": []string{state}}
+	_, responsePayload, err := a.keeperRequest(r.Context(), cfg, http.MethodGet, "/v0/management/get-auth-status", query, nil, time.Duration(cfg.CodexKeeper.CPATimeoutSeconds)*time.Second)
+	if err != nil {
+		return err
+	}
+	response, err := parseKeeperOAuthObject(responsePayload, "查询 OAuth 登录状态")
+	if err != nil {
+		return err
+	}
+	status := firstKeeperOAuthString(response, "status", "state", "result")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":     state,
+		"status":    status,
+		"completed": keeperOAuthCompleted(response),
+		"raw":       response,
+	})
+	return nil
+}
+
+func (a *App) submitKeeperOAuthCallback(w http.ResponseWriter, r *http.Request) error {
+	var payload keeperOAuthCallbackRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		return err
+	}
+	provider, err := normalizeKeeperOAuthProvider(payload.Provider)
+	if err != nil {
+		return err
+	}
+	redirectURL := strings.TrimSpace(payload.RedirectURL)
+	if redirectURL == "" {
+		return validationError("OAuth callback URL 不能为空")
+	}
+	parsed, err := url.Parse(redirectURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return validationError("OAuth callback URL 必须是完整的 http:// 或 https:// 地址")
+	}
+	cfg, err := a.loadConfig(r.Context())
+	if err != nil {
+		return err
+	}
+	if err := requireKeeperManagementConfig(cfg); err != nil {
+		return err
+	}
+	body := map[string]string{
+		"provider":     provider.CallbackProvider,
+		"redirect_url": redirectURL,
+	}
+	_, responsePayload, err := a.keeperRequest(r.Context(), cfg, http.MethodPost, "/v0/management/oauth-callback", nil, body, time.Duration(cfg.CodexKeeper.CPATimeoutSeconds)*time.Second)
+	if err != nil {
+		return err
+	}
+	response, err := parseKeeperOAuthObject(responsePayload, "提交 OAuth callback")
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider": provider.Key,
+		"status":   firstKeeperOAuthString(response, "status", "state", "result"),
+		"raw":      response,
+	})
+	return nil
+}
+
+func requireKeeperManagementConfig(cfg AppConfig) error {
+	if strings.TrimSpace(cfg.Collector.CLIProxyURL) == "" {
+		return validationError("请先在系统设置中填写 CLIProxyAPI 地址")
+	}
+	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
+		return validationError("请先在系统设置中填写 CLIProxyAPI 管理密钥")
+	}
+	return nil
+}
+
+func normalizeKeeperOAuthProvider(value string) (keeperOAuthProvider, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "codex", "openai", "chatgpt":
+		return keeperOAuthProvider{
+			Key:              "codex",
+			Label:            "Codex / OpenAI",
+			AuthURLPath:      "/v0/management/codex-auth-url",
+			CallbackProvider: "codex",
+		}, nil
+	case "anthropic", "claude":
+		return keeperOAuthProvider{
+			Key:              "anthropic",
+			Label:            "Claude",
+			AuthURLPath:      "/v0/management/anthropic-auth-url",
+			CallbackProvider: "anthropic",
+		}, nil
+	case "gemini", "gemini-cli", "google":
+		return keeperOAuthProvider{
+			Key:              "gemini",
+			Label:            "Gemini CLI",
+			AuthURLPath:      "/v0/management/gemini-cli-auth-url",
+			CallbackProvider: "gemini",
+			AllowsProjectID:  true,
+		}, nil
+	case "antigravity":
+		return keeperOAuthProvider{
+			Key:              "antigravity",
+			Label:            "Antigravity",
+			AuthURLPath:      "/v0/management/antigravity-auth-url",
+			CallbackProvider: "antigravity",
+		}, nil
+	case "kimi":
+		return keeperOAuthProvider{
+			Key:              "kimi",
+			Label:            "Kimi",
+			AuthURLPath:      "/v0/management/kimi-auth-url",
+			CallbackProvider: "kimi",
+		}, nil
+	default:
+		return keeperOAuthProvider{}, validationError("不支持的 OAuth provider")
+	}
+}
+
+func parseKeeperOAuthObject(payload []byte, action string) (map[string]any, error) {
+	var response map[string]any
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return nil, validationError(action + "失败：CLIProxyAPI 响应不是有效 JSON")
+	}
+	return response, nil
+}
+
+func firstKeeperOAuthString(source map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := source[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func keeperOAuthCompleted(source map[string]any) bool {
+	for _, key := range []string{"completed", "done", "success", "ok"} {
+		if value, ok := source[key].(bool); ok && value {
+			return true
+		}
+	}
+	status := strings.ToLower(firstKeeperOAuthString(source, "status", "state", "result"))
+	switch status {
+	case "ok", "success", "succeeded", "done", "completed", "complete", "finished", "ready":
+		return true
+	default:
+		return false
 	}
 }
 
