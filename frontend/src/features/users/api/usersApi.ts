@@ -1,5 +1,6 @@
 import { apiClient } from '@/shared/api/apiClient'
 import type {
+  ApiKeyCreatePayload,
   UserApiKeyBindPayload,
   UserApiKeySummary,
   UserPayload,
@@ -45,6 +46,13 @@ export function bindUserApiKey(
   payload: UserApiKeyBindPayload,
 ): Promise<UserApiKeySummary> {
   return apiClient.post<UserApiKeySummary>(`/users/${userId}/api-keys`, payload)
+}
+
+export function createUserApiKey(
+  userId: number,
+  payload: ApiKeyCreatePayload,
+): Promise<UserApiKeySummary> {
+  return apiClient.post<UserApiKeySummary>(`/users/${userId}/api-keys/create`, payload)
 }
 
 export function unbindUserApiKey(userId: number, apiKeyHash: string): Promise<void> {

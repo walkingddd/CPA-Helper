@@ -14,12 +14,15 @@ import {
   NSpace,
   NSwitch,
   NTag,
+  NTooltip,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
 import { CircleDollarSign, KeyRound, ShieldCheck, UserRound } from 'lucide-vue-next'
 
+import ApiKeyCreateModal from '@/features/api-keys/components/ApiKeyCreateModal.vue'
 import {
+  createUserApiKey,
   createUser,
   disableUser,
   enableUser,
@@ -28,7 +31,8 @@ import {
   updateUserQuota,
 } from '@/features/users/api/usersApi'
 import { useI18n } from '@/shared/i18n'
-import type { UserSummary } from '@/shared/types/api'
+import type { ApiKeyCreatePayload, UserSummary } from '@/shared/types/api'
+import { copyToClipboard } from '@/shared/utils/clipboard'
 import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/shared/utils/format'
 
 const message = useMessage()
@@ -45,7 +49,13 @@ const userNickname = ref('')
 const quotaUnlimited = ref(true)
 const quotaLifetimeUsd = ref(0)
 const quotaMonthlyUsd = ref(0)
+const apiKeyCreatorVisible = ref(false)
+const apiKeyTarget = ref<UserSummary | null>(null)
+const isCreatingApiKey = ref(false)
+const createdApiKey = ref<string | null>(null)
+const createdApiKeyUserLabel = ref('')
 const isEditingFirstUser = computed(() => editingUserId.value === 1)
+const apiKeyTargetLabel = computed(() => (apiKeyTarget.value ? apiKeyUserLabel(apiKeyTarget.value) : ''))
 
 interface UserMetricCard {
   key: string
@@ -99,6 +109,11 @@ const userMetrics = computed<UserMetricCard[]>(() => {
 
 function userLabel(row: UserSummary): string {
   return row.nickname.trim() || row.username.trim() || t('未知用户', 'Unknown user')
+}
+
+function apiKeyUserLabel(row: UserSummary): string {
+  const label = userLabel(row)
+  return label === row.username ? row.username : `${label} (${row.username})`
 }
 
 function quotaBalanceValue(row: UserSummary, bucket: 'monthly' | 'lifetime'): string {
@@ -212,6 +227,94 @@ async function refresh() {
 
 function isUserDisabled(row: UserSummary): boolean {
   return row.disabled_at !== null
+}
+
+function apiKeyCreationBlockedReason(row: UserSummary): string | null {
+  if (isUserDisabled(row)) {
+    return t('该用户已禁用，无法创建 API 密钥', 'This user is disabled and cannot create API keys')
+  }
+  if (!row.quota.can_create_keys) {
+    return t('该用户额度不足，无法创建 API 密钥', 'This user has insufficient quota to create API keys')
+  }
+  return null
+}
+
+function openApiKeyCreator(row: UserSummary) {
+  const blockedReason = apiKeyCreationBlockedReason(row)
+  if (blockedReason) {
+    message.error(blockedReason)
+    return
+  }
+  apiKeyTarget.value = row
+  apiKeyCreatorVisible.value = true
+}
+
+async function createApiKeyForUser(payload: ApiKeyCreatePayload) {
+  const target = apiKeyTarget.value
+  if (!target || isCreatingApiKey.value) {
+    return
+  }
+  const blockedReason = apiKeyCreationBlockedReason(target)
+  if (blockedReason) {
+    message.error(blockedReason)
+    return
+  }
+  isCreatingApiKey.value = true
+  try {
+    const created = await createUserApiKey(target.id, payload)
+    createdApiKey.value = created.api_key ?? payload.api_key ?? null
+    createdApiKeyUserLabel.value = apiKeyUserLabel(target)
+    apiKeyCreatorVisible.value = false
+    message.success(t('API 密钥已创建并同步到 CPA', 'API key created and synced to CPA'))
+    await refresh()
+  } catch (error) {
+    message.error(errorText(error, '创建 API 密钥失败', 'Failed to create API key'))
+  } finally {
+    isCreatingApiKey.value = false
+  }
+}
+
+async function copyCreatedApiKey() {
+  if (!createdApiKey.value) {
+    return
+  }
+  try {
+    await copyToClipboard(createdApiKey.value)
+    message.success(t('API 密钥已复制', 'API key copied'))
+  } catch (error) {
+    message.error(errorText(error, '复制失败', 'Copy failed'))
+  }
+}
+
+function closeCreatedApiKey() {
+  createdApiKey.value = null
+  createdApiKeyUserLabel.value = ''
+}
+
+function renderApiKeyCreator(row: UserSummary) {
+  const blockedReason = apiKeyCreationBlockedReason(row)
+  const button = h(
+    NButton,
+    {
+      size: 'small',
+      quaternary: true,
+      type: 'primary',
+      disabled: Boolean(blockedReason),
+      onClick: () => openApiKeyCreator(row),
+    },
+    { default: () => t('创建 Key', 'Create key') },
+  )
+  if (!blockedReason) {
+    return button
+  }
+  return h(
+    NTooltip,
+    { placement: 'top' },
+    {
+      trigger: () => h('span', { class: 'disabled-action-trigger' }, [button]),
+      default: () => blockedReason,
+    },
+  )
 }
 
 async function disableUserRow(row: UserSummary) {
@@ -412,7 +515,7 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
   {
     title: '',
     key: 'actions',
-    width: 90,
+    width: 190,
     fixed: 'right',
     render: (row) =>
       h(
@@ -420,6 +523,7 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
         { size: 4 },
         {
           default: () => [
+            row.is_admin ? null : renderApiKeyCreator(row),
             h(
               NButton,
               { size: 'small', quaternary: true, onClick: () => editUser(row) },
@@ -488,6 +592,19 @@ onMounted(refresh)
     </div>
 
     <section class="panel table-panel">
+      <div v-if="createdApiKey" class="created-key-box">
+        <div class="created-key-main">
+          <div class="created-key-title">
+            {{ t(`${createdApiKeyUserLabel} 的新密钥`, `New key for ${createdApiKeyUserLabel}`) }}
+          </div>
+          <div class="created-key-value">{{ createdApiKey }}</div>
+        </div>
+        <NSpace>
+          <NButton secondary @click="copyCreatedApiKey">{{ t('复制', 'Copy') }}</NButton>
+          <NButton tertiary @click="closeCreatedApiKey">{{ t('关闭', 'Close') }}</NButton>
+        </NSpace>
+      </div>
+
       <NDataTable
         size="small"
         :loading="isLoading"
@@ -498,6 +615,14 @@ onMounted(refresh)
         :scroll-x="2000"
       />
     </section>
+
+    <ApiKeyCreateModal
+      v-model:show="apiKeyCreatorVisible"
+      :title="t('为用户创建 API 密钥', 'Create API key for user')"
+      :target-label="apiKeyTargetLabel"
+      :loading="isCreatingApiKey"
+      @submit="createApiKeyForUser"
+    />
 
     <NModal
       v-model:show="editorVisible"
@@ -599,6 +724,40 @@ onMounted(refresh)
 
 .user-editor-warning {
   margin-bottom: 12px;
+}
+
+.created-key-box {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  margin-bottom: 14px;
+  padding: 16px;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  background:
+    linear-gradient(135deg, rgb(0 154 168 / 10%), rgb(29 141 255 / 7%)),
+    var(--cpa-primary-wash);
+  box-shadow: var(--cpa-shadow-hairline);
+}
+
+.created-key-main {
+  min-width: 0;
+}
+
+.created-key-title {
+  margin-bottom: 4px;
+  font-weight: 700;
+}
+
+.created-key-value {
+  overflow-wrap: anywhere;
+  font-family: Consolas, 'SFMono-Regular', 'Microsoft YaHei UI', monospace;
+  font-size: 13px;
+}
+
+:global(.disabled-action-trigger) {
+  display: inline-flex;
 }
 
 .quota-editor-grid {
@@ -740,6 +899,11 @@ onMounted(refresh)
 
   .quota-editor-grid {
     grid-template-columns: 1fr;
+  }
+
+  .created-key-box {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 </style>

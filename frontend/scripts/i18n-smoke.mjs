@@ -132,6 +132,18 @@ try {
     'API key description is required',
   )
   assert.equal(
+    localizedApiErrorMessage('validation_error', 'API KEY 不能包含空白或控制字符'),
+    'API key cannot contain whitespace or control characters',
+  )
+  assert.equal(
+    localizedApiErrorMessage('conflict', 'API KEY 已存在，不能重复创建'),
+    'API key already exists and cannot be created again',
+  )
+  assert.equal(
+    localizedApiErrorMessage('upstream_error', 'CPA API KEY 同步状态无法确认，请刷新后检查'),
+    'CPA API key sync status could not be confirmed. Refresh and verify the key before retrying.',
+  )
+  assert.equal(
     localizedServerMessage('请求体不是有效 JSON'),
     'Request body is not valid JSON',
   )
