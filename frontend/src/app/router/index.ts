@@ -104,6 +104,11 @@ export const router = createRouter({
           props: { scope: 'account' },
         },
         {
+          path: 'account/channel-status',
+          name: 'account-channel-status',
+          component: () => import('@/features/codex-keeper/views/ChannelStatusView.vue'),
+        },
+        {
           path: 'account/keys',
           name: 'account-api-keys',
           component: () => import('@/features/api-keys/views/ApiKeysView.vue'),
@@ -131,6 +136,12 @@ export const router = createRouter({
       name: 'legacy-records',
       component: () => import('@/app/layout/AppShell.vue'),
       meta: { adminTarget: '/admin/records', accountTarget: '/account/records' },
+    },
+    {
+      path: '/channel-status',
+      name: 'legacy-channel-status',
+      component: () => import('@/app/layout/AppShell.vue'),
+      meta: { adminTarget: '/account/channel-status', accountTarget: '/account/channel-status' },
     },
     {
       path: '/users',

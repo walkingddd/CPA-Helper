@@ -46,6 +46,22 @@ type keeperAccountsResponse struct {
 	} `json:"items"`
 }
 
+type channelStatusTestResponse struct {
+	Items []struct {
+		ID                 string  `json:"id"`
+		Name               string  `json:"name"`
+		Email              *string `json:"email"`
+		AccountType        *string `json:"account_type"`
+		Status             string  `json:"status"`
+		StatusLabel        string  `json:"status_label"`
+		StatusDetail       string  `json:"status_detail"`
+		PrimaryUsedPercent *int    `json:"primary_used_percent"`
+		LastError          *string `json:"last_error"`
+		LatestAction       *string `json:"latest_action"`
+	} `json:"items"`
+	RefreshedAt string `json:"refreshed_at"`
+}
+
 type collectorStatusTimeResponse struct {
 	LastPollAt    *string `json:"last_poll_at"`
 	LastSuccessAt *string `json:"last_success_at"`
@@ -1169,6 +1185,85 @@ func TestKeeperRefreshDisabledAccountChecksUsageAndRecordsBadCredential(t *testi
 	}
 	if priorityPatchCount != 1 {
 		t.Fatalf("priority patch count = %d, want 1", priorityPatchCount)
+	}
+}
+
+func TestChannelStatusIsAvailableToMembersAndMasksAccountIdentifiers(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	adminCookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/users", map[string]any{
+		"username": "member",
+		"password": "member-password",
+		"nickname": "Member",
+		"is_admin": false,
+	}, adminCookies, nil)
+	memberCookies := requestJSON(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "member",
+		"password": "member-password",
+	}, nil, nil)
+
+	db, err := sql.Open("sqlite", filepath.Join(dataDir, "db", "cpa_helper.sqlite3")+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	const authName = "secret-auth-file-001.json"
+	const email = "private.user@example.com"
+	_, err = db.Exec(`
+		INSERT INTO codex_keeper_auth_states (
+			auth_name, email, account_type, disabled, priority, primary_used_percent,
+			last_status_code, last_error, latest_action, last_checked_at, created_at, updated_at
+		) VALUES (?, ?, 'pro', 0, 3, 12, 500, ?, ?, ?, ?, ?)
+	`, authName, email, "failure for "+authName+" / "+email, "checked "+authName, "2026-05-13 12:00:01.123456", "2026-05-13 11:59:58.000000", "2026-05-13 11:59:58.000000")
+	if err != nil {
+		t.Fatalf("insert keeper account state: %v", err)
+	}
+
+	requestJSONExpectStatus(t, handler, http.MethodGet, "/api/channel-status", nil, nil, http.StatusUnauthorized)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/channel-status", nil)
+	for _, cookie := range memberCookies {
+		request.AddCookie(cookie)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /api/channel-status returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, authName) || strings.Contains(body, email) {
+		t.Fatalf("channel status leaked raw identifiers: %s", body)
+	}
+
+	response := channelStatusTestResponse{}
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		t.Fatalf("decode channel status response: %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items length = %d, want 1", len(response.Items))
+	}
+	item := response.Items[0]
+	if item.ID != "channel-1" || item.Name != "Channel 1" {
+		t.Fatalf("channel identity = %q/%q, want masked channel identity", item.ID, item.Name)
+	}
+	if item.Email == nil || *item.Email != "p***@e***" {
+		t.Fatalf("masked email = %v, want p***@e***", item.Email)
+	}
+	if item.Status != "error" || item.LastError == nil || strings.Contains(*item.LastError, authName) || strings.Contains(*item.LastError, email) {
+		t.Fatalf("status/error = %q/%v, want redacted error status", item.Status, item.LastError)
 	}
 }
 

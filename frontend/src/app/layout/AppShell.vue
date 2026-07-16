@@ -31,6 +31,7 @@ import {
   Menu,
   Monitor,
   Moon,
+  RadioTower,
   Settings,
   Shield,
   Store,
@@ -141,6 +142,7 @@ const accountInspectionMenuItems = computed<MenuOption[]>(() => [
 const accountMenuItems = computed<MenuOption[]>(() => [
   { label: t('我的用量', 'My Usage'), key: '/account/usage', icon: renderIcon(BarChart3) },
   { label: t('我的明细', 'My Records'), key: '/account/records', icon: renderIcon(List) },
+  { label: t('Channel Status', 'Channel Status'), key: '/account/channel-status', icon: renderIcon(RadioTower) },
   { label: t('API 密钥', 'API Keys'), key: '/account/keys', icon: renderIcon(KeyRound) },
   { label: t('可用模型', 'Available Models'), key: '/account/models', icon: renderIcon(Cpu) },
   { label: t('账户设置', 'Account Settings'), key: '/account/settings', icon: renderIcon(UserRound) },

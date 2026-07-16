@@ -260,6 +260,46 @@ export interface CodexKeeperAccountsResponse {
   items: CodexKeeperAccount[]
 }
 
+export type ChannelStatusState =
+  | 'healthy'
+  | 'checked'
+  | 'disabled'
+  | 'unauthorized'
+  | 'quota_exhausted'
+  | 'error'
+  | 'unknown'
+
+export interface ChannelStatusItem {
+  id: string
+  name: string
+  email: string | null
+  account_type: string | null
+  disabled: boolean
+  priority: number | null
+  status: ChannelStatusState
+  status_label: string
+  status_detail: string
+  primary_used_percent: number | null
+  secondary_used_percent: number | null
+  primary_reset_at: string | null
+  secondary_reset_at: string | null
+  primary_window_seconds: number | null
+  secondary_window_seconds: number | null
+  primary_window_usage: CodexKeeperQuotaWindowUsage | null
+  secondary_window_usage: CodexKeeperQuotaWindowUsage | null
+  quota_threshold: number | null
+  last_status_code: number | null
+  last_error: string | null
+  latest_action: string | null
+  last_checked_at: string | null
+  last_healthy_at: string | null
+}
+
+export interface ChannelStatusResponse {
+  items: ChannelStatusItem[]
+  refreshed_at: string
+}
+
 export interface CodexKeeperBulkDeletePayload {
   auth_names: string[]
 }

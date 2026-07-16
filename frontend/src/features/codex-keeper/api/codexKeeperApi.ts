@@ -1,5 +1,6 @@
 import { apiClient } from '@/shared/api/apiClient'
 import type {
+  ChannelStatusResponse,
   CodexKeeperBulkDeletePayload,
   CodexKeeperBulkDeleteResponse,
   CodexKeeperCronPreviewPayload,
@@ -15,6 +16,10 @@ import type {
   CodexKeeperSettingsUpdatePayload,
   CodexKeeperStatus,
 } from '@/shared/types/api'
+
+export function getChannelStatus(): Promise<ChannelStatusResponse> {
+  return apiClient.get<ChannelStatusResponse>('/channel-status')
+}
 
 export function getCodexKeeperSettings(): Promise<CodexKeeperSettings> {
   return apiClient.get<CodexKeeperSettings>('/codex-keeper/settings')

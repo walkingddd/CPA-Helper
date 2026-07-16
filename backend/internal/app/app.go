@@ -271,6 +271,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("/api/card-shops/favorites", a.wrap(a.handleCardShopFavorites))
 	mux.HandleFunc("/api/card-shops/tags", a.wrap(a.handleCardShopTags))
 	mux.HandleFunc("/api/card-shops", a.wrap(a.handleCardShops))
+	mux.HandleFunc("/api/channel-status", a.wrap(a.handleChannelStatus))
 	mux.HandleFunc("/api/codex-keeper/", a.wrap(a.handleCodexKeeper))
 	mux.HandleFunc("/api/account-allocations", a.wrap(a.handleAccountAllocations))
 	mux.HandleFunc("/api/account-allocations/", a.wrap(a.handleAccountAllocations))
