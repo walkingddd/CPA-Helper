@@ -609,6 +609,9 @@ function formatLatency(value: number | null): string {
   if (value === null) {
     return '-'
   }
+  if (value >= 1000) {
+    return `${+(value / 1000).toFixed(2)} s`
+  }
   return `${formatInteger(Math.round(value))} ms`
 }
 
