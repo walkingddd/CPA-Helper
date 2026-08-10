@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	backendApp "cpa-helper/backend/internal/app"
@@ -14,6 +16,95 @@ import (
 type apiKeyCreateResponse struct {
 	APIKey     string `json:"api_key"`
 	APIKeyHash string `json:"api_key_hash"`
+	UserID     *int   `json:"user_id"`
+}
+
+type fakeCPAAPIKeys struct {
+	mu             sync.Mutex
+	keys           []string
+	getCalls       int
+	patchCalls     int
+	failPatch      bool
+	failAfterPatch bool
+}
+
+func (fake *fakeCPAAPIKeys) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v0/management/api-keys" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	switch r.Method {
+	case http.MethodGet:
+		fake.getCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"api-keys": fake.keys})
+	case http.MethodPatch:
+		fake.patchCalls++
+		if fake.failPatch {
+			http.Error(w, "remote write failed", http.StatusInternalServerError)
+			return
+		}
+		var payload struct {
+			Old string `json:"old"`
+			New string `json:"new"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, key := range fake.keys {
+			if key == payload.New {
+				if fake.failAfterPatch {
+					http.Error(w, "remote response failed after write", http.StatusInternalServerError)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"api-keys": fake.keys})
+				return
+			}
+		}
+		fake.keys = append(fake.keys, payload.New)
+		if fake.failAfterPatch {
+			http.Error(w, "remote response failed after write", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"api-keys": fake.keys})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (fake *fakeCPAAPIKeys) snapshot() ([]string, int, int) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return append([]string(nil), fake.keys...), fake.getCalls, fake.patchCalls
+}
+
+func newConfiguredAPIKeyTestHandler(t *testing.T, fake *fakeCPAAPIKeys) (http.Handler, []*http.Cookie) {
+	t.Helper()
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := httptest.NewServer(fake)
+	t.Cleanup(cpa.Close)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	t.Cleanup(app.Close)
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     cpa.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+	return handler, cookies
 }
 
 func TestListAPIKeysReturnsEmptyArrayForFreshAccount(t *testing.T) {
@@ -508,6 +599,11 @@ func TestCreateAPIKeyWithoutCPAConfigGuidesToSettings(t *testing.T) {
 		!strings.Contains(message, "CLIProxyAPI 地址和管理密钥") {
 		t.Fatalf("missing actionable CPA config guidance in response: %s", message)
 	}
+	var keys []apiKeyCreateResponse
+	requestJSON(t, handler, http.MethodGet, "/api/api-keys", nil, cookies, &keys)
+	if len(keys) != 0 {
+		t.Fatalf("missing CPA config left a local API key placeholder: %#v", keys)
+	}
 }
 
 func TestCreateAPIKeyUsesPatchAppendWhenRemoteListIsEmpty(t *testing.T) {
@@ -598,5 +694,266 @@ func TestCreateAPIKeyUsesPatchAppendWhenRemoteListIsEmpty(t *testing.T) {
 	}
 	if patchCalls != 1 || getCalls != 0 || putCalls != 0 {
 		t.Fatalf("remote call counts patch/get/put = %d/%d/%d, want 1/0/0", patchCalls, getCalls, putCalls)
+	}
+}
+
+func TestCurrentUserCanCreateGeneratedAndCustomAPIKeys(t *testing.T) {
+	fake := &fakeCPAAPIKeys{}
+	handler, cookies := newConfiguredAPIKeyTestHandler(t, fake)
+
+	customKey := "legacy-Team_KEY.123"
+	custom := apiKeyCreateResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/api-keys", map[string]any{
+		"description": "旧网关迁移",
+		"api_key":     customKey,
+	}, cookies, &custom)
+	if custom.APIKey != customKey || custom.APIKeyHash == "" {
+		t.Fatalf("custom key response = %#v, want full custom key", custom)
+	}
+
+	generated := apiKeyCreateResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/api-keys", map[string]any{
+		"description": "自动生成",
+	}, cookies, &generated)
+	if !strings.HasPrefix(generated.APIKey, "sk-") || generated.APIKeyHash == "" {
+		t.Fatalf("generated key response = %#v, want generated full key", generated)
+	}
+
+	remoteKeys, getCalls, patchCalls := fake.snapshot()
+	if len(remoteKeys) != 2 || remoteKeys[0] != customKey || remoteKeys[1] != generated.APIKey {
+		t.Fatalf("remote keys = %#v, want custom and generated keys", remoteKeys)
+	}
+	if getCalls != 1 || patchCalls != 2 {
+		t.Fatalf("remote GET/PATCH calls = %d/%d, want 1/2", getCalls, patchCalls)
+	}
+}
+
+func TestAdminCanCreateGeneratedAndCustomAPIKeysForUser(t *testing.T) {
+	fake := &fakeCPAAPIKeys{}
+	handler, adminCookies := newConfiguredAPIKeyTestHandler(t, fake)
+
+	var member struct {
+		ID int `json:"id"`
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/users", map[string]any{
+		"username": "member",
+		"password": "member-password",
+		"nickname": "Member",
+		"is_admin": false,
+	}, adminCookies, &member)
+	path := "/api/users/" + strconv.Itoa(member.ID) + "/api-keys/create"
+
+	customKey := "member-existing-key"
+	custom := apiKeyCreateResponse{}
+	requestJSON(t, handler, http.MethodPost, path, map[string]any{
+		"description": "成员迁移 Key",
+		"api_key":     customKey,
+	}, adminCookies, &custom)
+	if custom.APIKey != customKey || custom.UserID == nil || *custom.UserID != member.ID {
+		t.Fatalf("admin custom key response = %#v, want member ownership", custom)
+	}
+
+	generated := apiKeyCreateResponse{}
+	requestJSON(t, handler, http.MethodPost, path, map[string]any{
+		"description": "成员自动 Key",
+	}, adminCookies, &generated)
+	if !strings.HasPrefix(generated.APIKey, "sk-") || generated.UserID == nil || *generated.UserID != member.ID {
+		t.Fatalf("admin generated key response = %#v, want member ownership", generated)
+	}
+
+	memberCookies := requestJSON(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "member",
+		"password": "member-password",
+	}, nil, nil)
+	var memberKeys []apiKeyCreateResponse
+	requestJSON(t, handler, http.MethodGet, "/api/api-keys", nil, memberCookies, &memberKeys)
+	if len(memberKeys) != 2 {
+		t.Fatalf("member keys = %#v, want 2 admin-created keys", memberKeys)
+	}
+
+	requestJSONExpectStatus(t, handler, http.MethodPost, path, map[string]any{
+		"description": "越权创建",
+	}, memberCookies, http.StatusForbidden)
+}
+
+func TestCreateCustomAPIKeyValidation(t *testing.T) {
+	fake := &fakeCPAAPIKeys{}
+	handler, cookies := newConfiguredAPIKeyTestHandler(t, fake)
+
+	tests := []struct {
+		name string
+		body map[string]any
+	}{
+		{name: "empty", body: map[string]any{"description": "Key", "api_key": ""}},
+		{name: "null", body: map[string]any{"description": "Key", "api_key": nil}},
+		{name: "blank", body: map[string]any{"description": "Key", "api_key": " \t "}},
+		{name: "leading whitespace", body: map[string]any{"description": "Key", "api_key": " key"}},
+		{name: "trailing whitespace", body: map[string]any{"description": "Key", "api_key": "key "}},
+		{name: "internal whitespace", body: map[string]any{"description": "Key", "api_key": "key value"}},
+		{name: "control character", body: map[string]any{"description": "Key", "api_key": "key\nvalue"}},
+		{name: "key too long", body: map[string]any{"description": "Key", "api_key": strings.Repeat("x", 401)}},
+		{name: "description too long", body: map[string]any{"description": strings.Repeat("d", 241), "api_key": "valid-key"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requestJSONExpectStatus(t, handler, http.MethodPost, "/api/api-keys", test.body, cookies, http.StatusUnprocessableEntity)
+		})
+	}
+
+	remoteKeys, getCalls, patchCalls := fake.snapshot()
+	if len(remoteKeys) != 0 || getCalls != 0 || patchCalls != 0 {
+		t.Fatalf("invalid input reached CPA: keys=%#v GET/PATCH=%d/%d", remoteKeys, getCalls, patchCalls)
+	}
+}
+
+func TestCreateCustomAPIKeyRejectsLocalAndRemoteDuplicates(t *testing.T) {
+	remoteOnlyKey := "remote-existing-key"
+	fake := &fakeCPAAPIKeys{keys: []string{remoteOnlyKey}}
+	handler, adminCookies := newConfiguredAPIKeyTestHandler(t, fake)
+
+	localKey := "locally-owned-key"
+	requestJSON(t, handler, http.MethodPost, "/api/api-keys", map[string]any{
+		"description": "管理员 Key",
+		"api_key":     localKey,
+	}, adminCookies, nil)
+
+	var member struct {
+		ID int `json:"id"`
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/users", map[string]any{
+		"username": "member",
+		"password": "member-password",
+		"nickname": "Member",
+		"is_admin": false,
+	}, adminCookies, &member)
+	path := "/api/users/" + strconv.Itoa(member.ID) + "/api-keys/create"
+	_, getCallsBeforeDuplicate, patchCallsBeforeDuplicate := fake.snapshot()
+	requestJSONExpectStatus(t, handler, http.MethodPost, path, map[string]any{
+		"description": "不能转移归属",
+		"api_key":     localKey,
+	}, adminCookies, http.StatusConflict)
+	_, getCallsAfterDuplicate, patchCallsAfterDuplicate := fake.snapshot()
+	if getCallsAfterDuplicate != getCallsBeforeDuplicate || patchCallsAfterDuplicate != patchCallsBeforeDuplicate {
+		t.Fatalf("local duplicate called CPA: GET %d->%d, PATCH %d->%d", getCallsBeforeDuplicate, getCallsAfterDuplicate, patchCallsBeforeDuplicate, patchCallsAfterDuplicate)
+	}
+
+	requestJSONExpectStatus(t, handler, http.MethodPost, path, map[string]any{
+		"description": "远端已有 Key",
+		"api_key":     remoteOnlyKey,
+	}, adminCookies, http.StatusConflict)
+	_, getCallsAfterRemoteDuplicate, patchCallsAfterRemoteDuplicate := fake.snapshot()
+	if getCallsAfterRemoteDuplicate != getCallsAfterDuplicate+1 || patchCallsAfterRemoteDuplicate != patchCallsAfterDuplicate {
+		t.Fatalf("remote duplicate calls GET/PATCH = %d/%d, want %d/%d", getCallsAfterRemoteDuplicate, patchCallsAfterRemoteDuplicate, getCallsAfterDuplicate+1, patchCallsAfterDuplicate)
+	}
+
+	memberCookies := requestJSON(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "member",
+		"password": "member-password",
+	}, nil, nil)
+	var memberKeys []apiKeyCreateResponse
+	requestJSON(t, handler, http.MethodGet, "/api/api-keys", nil, memberCookies, &memberKeys)
+	if len(memberKeys) != 0 {
+		t.Fatalf("duplicate creation changed member ownership: %#v", memberKeys)
+	}
+	var adminKeys []apiKeyCreateResponse
+	requestJSON(t, handler, http.MethodGet, "/api/api-keys", nil, adminCookies, &adminKeys)
+	if len(adminKeys) != 1 || adminKeys[0].APIKey != localKey {
+		t.Fatalf("original admin ownership changed: %#v", adminKeys)
+	}
+}
+
+func TestCreateAPIKeyRemoteFailureRemovesLocalPlaceholder(t *testing.T) {
+	fake := &fakeCPAAPIKeys{failPatch: true}
+	handler, cookies := newConfiguredAPIKeyTestHandler(t, fake)
+
+	apiKey := "retry-after-remote-failure"
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/api-keys", map[string]any{
+		"description": "首次失败",
+		"api_key":     apiKey,
+	}, cookies, http.StatusUnprocessableEntity)
+	var keys []apiKeyCreateResponse
+	requestJSON(t, handler, http.MethodGet, "/api/api-keys", nil, cookies, &keys)
+	if len(keys) != 0 {
+		t.Fatalf("remote failure left local API key placeholder: %#v", keys)
+	}
+
+	fake.mu.Lock()
+	fake.failPatch = false
+	fake.mu.Unlock()
+	created := apiKeyCreateResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/api-keys", map[string]any{
+		"description": "重试成功",
+		"api_key":     apiKey,
+	}, cookies, &created)
+	if created.APIKey != apiKey {
+		t.Fatalf("retry response = %#v, want original custom key", created)
+	}
+}
+
+func TestCreateAPIKeyKeepsBindingWhenRemoteWriteSucceededBeforeError(t *testing.T) {
+	fake := &fakeCPAAPIKeys{failAfterPatch: true}
+	handler, cookies := newConfiguredAPIKeyTestHandler(t, fake)
+
+	apiKey := "written-before-error"
+	created := apiKeyCreateResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/api-keys", map[string]any{
+		"description": "响应失败前已写入",
+		"api_key":     apiKey,
+	}, cookies, &created)
+	if created.APIKey != apiKey || created.APIKeyHash == "" {
+		t.Fatalf("create response = %#v, want reconciled custom key", created)
+	}
+
+	remoteKeys, getCalls, patchCalls := fake.snapshot()
+	if len(remoteKeys) != 1 || remoteKeys[0] != apiKey {
+		t.Fatalf("remote keys = %#v, want reconciled key", remoteKeys)
+	}
+	if getCalls != 2 || patchCalls != 1 {
+		t.Fatalf("remote GET/PATCH calls = %d/%d, want precheck plus reconciliation and one write", getCalls, patchCalls)
+	}
+
+	var keys []apiKeyCreateResponse
+	requestJSON(t, handler, http.MethodGet, "/api/api-keys", nil, cookies, &keys)
+	if len(keys) != 1 || keys[0].APIKey != apiKey {
+		t.Fatalf("local API keys = %#v, want reconciled binding", keys)
+	}
+}
+
+func TestAdminCreateAPIKeyRequiresActiveUserWithQuota(t *testing.T) {
+	fake := &fakeCPAAPIKeys{}
+	handler, adminCookies := newConfiguredAPIKeyTestHandler(t, fake)
+
+	createMember := func(username string) int {
+		t.Helper()
+		var member struct {
+			ID int `json:"id"`
+		}
+		requestJSON(t, handler, http.MethodPost, "/api/users", map[string]any{
+			"username": username,
+			"password": "member-password",
+			"nickname": username,
+			"is_admin": false,
+		}, adminCookies, &member)
+		return member.ID
+	}
+
+	disabledID := createMember("disabled-member")
+	requestJSON(t, handler, http.MethodPost, "/api/users/"+strconv.Itoa(disabledID)+"/disable", nil, adminCookies, nil)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/users/"+strconv.Itoa(disabledID)+"/api-keys/create", map[string]any{
+		"description": "禁用用户",
+	}, adminCookies, http.StatusConflict)
+
+	exhaustedID := createMember("exhausted-member")
+	zero := 0
+	requestJSON(t, handler, http.MethodPut, "/api/users/"+strconv.Itoa(exhaustedID)+"/quota", map[string]any{
+		"lifetime_quota_usd": zero,
+	}, adminCookies, nil)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/users/"+strconv.Itoa(exhaustedID)+"/api-keys/create", map[string]any{
+		"description": "额度耗尽",
+	}, adminCookies, http.StatusConflict)
+
+	remoteKeys, getCalls, patchCalls := fake.snapshot()
+	if len(remoteKeys) != 0 || getCalls != 0 || patchCalls != 0 {
+		t.Fatalf("invalid target creation reached CPA: keys=%#v GET/PATCH=%d/%d", remoteKeys, getCalls, patchCalls)
 	}
 }

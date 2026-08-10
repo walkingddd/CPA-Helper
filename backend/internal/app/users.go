@@ -4,17 +4,24 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"log"
 	"math/big"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
-const generatedAPIKeyPrefix = "sk-"
-const generatedAPIKeyLength = 52
-const generatedAPIKeyAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+const (
+	generatedAPIKeyPrefix     = "sk-"
+	generatedAPIKeyLength     = 52
+	generatedAPIKeyAlphabet   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	maxAPIKeyLengthBytes      = 400
+	maxAPIKeyDescriptionRunes = 240
+)
 
 type userPayload struct {
 	Username string  `json:"username"`
@@ -29,8 +36,27 @@ type userAPIKeyBindPayload struct {
 	Description string  `json:"description"`
 }
 
+type optionalAPIKeyValue struct {
+	Value string
+	Set   bool
+}
+
+func (value *optionalAPIKeyValue) UnmarshalJSON(data []byte) error {
+	value.Set = true
+	if strings.TrimSpace(string(data)) == "null" {
+		value.Value = ""
+		return nil
+	}
+	return json.Unmarshal(data, &value.Value)
+}
+
 type apiKeyPayload struct {
 	Description string `json:"description"`
+}
+
+type apiKeyCreatePayload struct {
+	Description string              `json:"description"`
+	APIKey      optionalAPIKeyValue `json:"api_key"`
 }
 
 type UserRecord struct {
@@ -251,6 +277,21 @@ func (a *App) handleUserByPath(w http.ResponseWriter, r *http.Request) error {
 		writeJSON(w, http.StatusOK, summary)
 		return nil
 	}
+	if len(parts) == 3 && parts[1] == "api-keys" && parts[2] == "create" {
+		if err := requireMethod(r, http.MethodPost); err != nil {
+			return err
+		}
+		var payload apiKeyCreatePayload
+		if err := decodeJSON(r, &payload); err != nil {
+			return err
+		}
+		summary, err := a.createAPIKeyForUser(r.Context(), userID, payload)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, summary)
+		return nil
+	}
 	if len(parts) == 3 && parts[1] == "api-keys" {
 		if err := requireMethod(r, http.MethodDelete); err != nil {
 			return err
@@ -278,11 +319,11 @@ func (a *App) handleCurrentUserAPIKeys(w http.ResponseWriter, r *http.Request) e
 		writeJSON(w, http.StatusOK, keys)
 		return nil
 	case http.MethodPost:
-		var payload apiKeyPayload
+		var payload apiKeyCreatePayload
 		if err := decodeJSON(r, &payload); err != nil {
 			return err
 		}
-		summary, err := a.createGeneratedAPIKeyForUser(r.Context(), user.ID, user.Username, payload.Description)
+		summary, err := a.createAPIKeyForUser(r.Context(), user.ID, payload)
 		if err != nil {
 			return err
 		}
@@ -582,11 +623,20 @@ func (a *App) currentUserAPIKeys(ctx context.Context, user *AuthUser) ([]UserApi
 	return result, nil
 }
 
-func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, username, description string) (UserApiKeySummary, error) {
-	description = strings.TrimSpace(description)
-	if description == "" {
-		return UserApiKeySummary{}, validationError("API KEY 描述不能为空")
+func (a *App) createAPIKeyForUser(ctx context.Context, userID int, payload apiKeyCreatePayload) (UserApiKeySummary, error) {
+	description, err := normalizeAPIKeyDescription(payload.Description)
+	if err != nil {
+		return UserApiKeySummary{}, err
 	}
+
+	var apiKey string
+	if payload.APIKey.Set {
+		apiKey, err = validateCustomAPIKey(payload.APIKey.Value)
+		if err != nil {
+			return UserApiKeySummary{}, err
+		}
+	}
+
 	user, err := a.getActiveUser(ctx, userID)
 	if err != nil {
 		return UserApiKeySummary{}, err
@@ -594,24 +644,121 @@ func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, user
 	if err := a.ensureUserQuotaReadyForKeys(ctx, user.ID); err != nil {
 		return UserApiKeySummary{}, err
 	}
-	apiKey, err := a.generateUniqueAPIKey(ctx)
-	if err != nil {
+
+	if payload.APIKey.Set {
+		exists, err := a.localAPIKeyExists(ctx, hashAPIKey(apiKey))
+		if err != nil {
+			return UserApiKeySummary{}, err
+		}
+		if exists {
+			return UserApiKeySummary{}, conflictError("API KEY 已存在，不能重复创建")
+		}
+		exists, err = a.remoteAPIKeyExists(ctx, apiKey)
+		if err != nil {
+			return UserApiKeySummary{}, err
+		}
+		if exists {
+			return UserApiKeySummary{}, conflictError("API KEY 已存在于 CPA，请由管理员使用绑定功能关联用户")
+		}
+	} else {
+		if err := a.ensureAPIKeySyncConfigured(ctx); err != nil {
+			return UserApiKeySummary{}, err
+		}
+		apiKey, err = a.generateUniqueAPIKey(ctx)
+		if err != nil {
+			return UserApiKeySummary{}, err
+		}
+	}
+
+	apiKeyHash := hashAPIKey(apiKey)
+	if err := a.insertUserAPIKey(ctx, user.ID, apiKeyHash, apiKey, description); err != nil {
 		return UserApiKeySummary{}, err
 	}
 	if err := a.addRemoteAPIKey(ctx, apiKey); err != nil {
-		return UserApiKeySummary{}, err
-	}
-	apiKeyHash := hashAPIKey(apiKey)
-	if err := a.upsertUserAPIKey(ctx, user.ID, apiKeyHash, apiKey, description); err != nil {
-		_ = a.removeRemoteAPIKeyHash(ctx, apiKeyHash)
-		return UserApiKeySummary{}, err
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), apiKeySyncTimeout)
+		defer cancel()
+		remoteExists, verifyErr := a.remoteAPIKeyExists(cleanupCtx, apiKey)
+		if verifyErr != nil {
+			log.Printf("unable to verify CPA API key after sync failure user_id=%d api_key_hash=%s: sync_error=%v verify_error=%v", user.ID, apiKeyHash, err, verifyErr)
+			return UserApiKeySummary{}, appError("upstream_error", http.StatusBadGateway, "CPA API KEY 同步状态无法确认，请刷新后检查")
+		}
+		if !remoteExists {
+			if cleanupErr := a.deleteCreatedAPIKey(cleanupCtx, user.ID, apiKeyHash); cleanupErr != nil {
+				log.Printf("unable to clean local API key after sync failure user_id=%d api_key_hash=%s: sync_error=%v cleanup_error=%v", user.ID, apiKeyHash, err, cleanupErr)
+				return UserApiKeySummary{}, cleanupErr
+			}
+			return UserApiKeySummary{}, err
+		}
 	}
 	summary, err := a.keySummaryByHash(ctx, apiKeyHash, &apiKey)
 	if err != nil {
 		return UserApiKeySummary{}, err
 	}
-	summary.UserName = &username
+	summary.UserName = &user.Username
 	return summary, nil
+}
+
+func validateCustomAPIKey(apiKey string) (string, error) {
+	trimmed := strings.TrimSpace(apiKey)
+	if trimmed == "" {
+		return "", validationError("API KEY 不能为空")
+	}
+	if trimmed != apiKey {
+		return "", validationError("API KEY 不能包含首尾空白字符")
+	}
+	if len([]byte(apiKey)) > maxAPIKeyLengthBytes {
+		return "", validationError("API KEY 不能超过 400 字节")
+	}
+	for _, char := range apiKey {
+		if unicode.IsSpace(char) || unicode.IsControl(char) {
+			return "", validationError("API KEY 不能包含空白或控制字符")
+		}
+	}
+	return apiKey, nil
+}
+
+func normalizeAPIKeyDescription(value string) (string, error) {
+	description := strings.TrimSpace(value)
+	if description == "" {
+		return "", validationError("API KEY 描述不能为空")
+	}
+	if len([]rune(description)) > maxAPIKeyDescriptionRunes {
+		return "", validationError("API KEY 描述不能超过 240 个字符")
+	}
+	return description, nil
+}
+
+func (a *App) remoteAPIKeyExists(ctx context.Context, apiKey string) (bool, error) {
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
+		return false, validationError(apiKeySyncMissingConfigMessage)
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
+	defer cancel()
+	keys, err := a.remoteAPIKeys(syncCtx, cfg)
+	if err != nil {
+		return false, err
+	}
+	for _, existing := range keys {
+		if existing == apiKey {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (a *App) ensureAPIKeySyncConfigured(ctx context.Context) error {
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
+		return validationError(apiKeySyncMissingConfigMessage)
+	}
+	return nil
 }
 
 func (a *App) updateCurrentUserAPIKey(ctx context.Context, user *AuthUser, apiKeyHash, description string) (UserApiKeySummary, error) {
@@ -664,6 +811,43 @@ func (a *App) upsertUserAPIKey(ctx context.Context, userID int, apiKeyHash, apiK
 	return err
 }
 
+func (a *App) insertUserAPIKey(ctx context.Context, userID int, apiKeyHash, apiKey, description string) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := dbTime(time.Now())
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO user_api_keys (api_key_hash, user_id, api_key, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, apiKeyHash, userID, apiKey, description, now, now)
+	if err != nil {
+		if isUniqueConstraintError(err) {
+			return conflictError("API KEY 已存在，不能重复创建")
+		}
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, now, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (a *App) deleteCreatedAPIKey(ctx context.Context, userID int, apiKeyHash string) error {
+	_, err := a.db.ExecContext(ctx, `DELETE FROM user_api_keys WHERE user_id = ? AND api_key_hash = ?`, userID, apiKeyHash)
+	return err
+}
+
+func (a *App) localAPIKeyExists(ctx context.Context, apiKeyHash string) (bool, error) {
+	var count int
+	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_api_keys WHERE api_key_hash = ?`, apiKeyHash).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (a *App) generateUniqueAPIKey(ctx context.Context) (string, error) {
 	for i := 0; i < 10; i++ {
 		var builder strings.Builder
@@ -676,11 +860,11 @@ func (a *App) generateUniqueAPIKey(ctx context.Context) (string, error) {
 			builder.WriteByte(generatedAPIKeyAlphabet[index.Int64()])
 		}
 		apiKey := builder.String()
-		var count int
-		if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_api_keys WHERE api_key_hash = ?`, hashAPIKey(apiKey)).Scan(&count); err != nil {
+		exists, err := a.localAPIKeyExists(ctx, hashAPIKey(apiKey))
+		if err != nil {
 			return "", err
 		}
-		if count == 0 {
+		if !exists {
 			return apiKey, nil
 		}
 	}

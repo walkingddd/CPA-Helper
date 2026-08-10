@@ -45,7 +45,7 @@ For clarity, model requests initiated by an Agent are still sent directly from t
 - **Request record tracing**: Admins can filter global request events by time, user, API key description, provider, model, endpoint and failure state; regular users inspect only their own account records.
 - **User and permission management**: Provide administrator and regular-user views; admins can create or disable regular accounts and manage nicknames, login accounts, passwords and roles.
 - **User balances and automatic key pause**: Users are unlimited by default; admins can configure monthly balance and lifetime balance, usage is priced in USD with current model prices, monthly balance is consumed first, and exhausted users only have their CPA API keys paused.
-- **API key lifecycle management**: Each user can independently create, edit, copy and delete their own API keys and synchronize them to CPA, with usage counted per user and per-key request guidance plus live request testing.
+- **API key lifecycle management**: Each user can generate or supply a custom API key, then independently edit, copy and delete their own keys. Administrators can also create keys for regular users. Newly created keys are synchronized to CPA, with usage counted per user and per-key request guidance plus live request testing.
 - **Model pricing maintenance**: Maintain token-model input, output and cache prices in USD per million tokens; models whose name contains `image` are charged by a fixed USD price per successful request, with CPA model comparison for quickly filling LiteLLM / manual prices.
 - **Card shop index**: Admins can browse real-time public card-shop and product snapshots, search by product title, use popular tags, sort results and favorite shops for faster lookup. This is only a public information index and does not participate in transactions.
 - **Available model aggregation**: Query available models through the current account's bound CPA API keys and enrich them with local pricing data.
@@ -124,7 +124,7 @@ Each user can inspect request events and details scoped to their own account, se
 
 **API keys**
 
-Each account can independently create and manage its own API keys, review daily request, token, cost and balance summaries, and generate examples or run a live test request for each key.
+Each account can create and manage API keys using either automatic generation or a custom value. Administrators can also create keys for regular users. The page includes daily request, token, cost and balance summaries, plus request examples and live request testing for each key.
 
 ![API keys](pictures/API密钥.png)
 

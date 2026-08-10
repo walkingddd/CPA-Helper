@@ -37,10 +37,12 @@ import {
   testModelRequest,
   updateApiKey,
 } from '@/features/api-keys/api/apiKeysApi'
+import ApiKeyCreateModal from '@/features/api-keys/components/ApiKeyCreateModal.vue'
 import { listAvailableModels } from '@/features/models/api/availableModelsApi'
 import { getCurrentUserQuota } from '@/features/users/api/usersApi'
 import { getUsageOverview } from '@/features/usage/api/usageApi'
 import type {
+  ApiKeyCreatePayload,
   AvailableModel,
   AvailableModelsResponse,
   ModelRequestEndpoint,
@@ -64,6 +66,7 @@ const usageSummary = ref<UsageSummary | null>(null)
 const quotaStatus = ref<UserQuotaStatus | null>(null)
 const modelRequestGuide = ref<ModelRequestGuide | null>(null)
 const availableModels = ref<AvailableModelsResponse | null>(null)
+const createVisible = ref(false)
 const editorVisible = ref(false)
 const requestTestVisible = ref(false)
 const requestTestApiKey = ref<UserApiKeySummary | null>(null)
@@ -509,11 +512,7 @@ function openCreateDialog() {
     message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
     return
   }
-  editingApiKeyHash.value = null
-  apiKeyDescription.value = 'VSCode'
-  generatedApiKey.value = null
-  generatedApiKeyHash.value = null
-  editorVisible.value = true
+  createVisible.value = true
 }
 
 function closeGeneratedApiKey() {
@@ -556,8 +555,31 @@ async function refresh() {
   }
 }
 
-async function saveApiKey() {
+async function createNewApiKey(payload: ApiKeyCreatePayload) {
   if (isSaving.value) {
+    return
+  }
+  if (!canCreateApiKey.value) {
+    message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
+    return
+  }
+  isSaving.value = true
+  try {
+    const created = await createApiKey(payload)
+    generatedApiKey.value = created.api_key ?? payload.api_key ?? null
+    generatedApiKeyHash.value = created.api_key_hash
+    createVisible.value = false
+    message.success(t('API 密钥已创建并同步到 CPA', 'API key created and synced to CPA'))
+    await refresh()
+  } catch (error) {
+    message.error(errorText(error, '创建 API 密钥失败', 'Failed to create API key'))
+  } finally {
+    isSaving.value = false
+  }
+}
+
+async function saveApiKey() {
+  if (isSaving.value || !editingApiKeyHash.value) {
     return
   }
   const description = apiKeyDescription.value.trim()
@@ -567,19 +589,8 @@ async function saveApiKey() {
   }
   isSaving.value = true
   try {
-    if (editingApiKeyHash.value) {
-      await updateApiKey(editingApiKeyHash.value, { description })
-      message.success(t('API 密钥已更新', 'API key updated'))
-    } else {
-      if (!canCreateApiKey.value) {
-        message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
-        return
-      }
-      const created = await createApiKey({ description })
-      generatedApiKey.value = created.api_key ?? null
-      generatedApiKeyHash.value = created.api_key_hash
-      message.success(t('API 密钥已创建并同步到 CPA', 'API key created and synced to CPA'))
-    }
+    await updateApiKey(editingApiKeyHash.value, { description })
+    message.success(t('API 密钥已更新', 'API key updated'))
     editorVisible.value = false
     editingApiKeyHash.value = null
     await refresh()
@@ -763,12 +774,19 @@ onMounted(refresh)
       </div>
     </section>
 
+    <ApiKeyCreateModal
+      v-model:show="createVisible"
+      :title="t('新建 API 密钥', 'New API key')"
+      :loading="isSaving"
+      @submit="createNewApiKey"
+    />
+
     <NModal
       v-model:show="editorVisible"
       preset="card"
       :mask-closable="false"
       :closable="false"
-      :title="editingApiKeyHash ? t('编辑 API 密钥', 'Edit API key') : t('新建 API 密钥', 'New API key')"
+      :title="t('编辑 API 密钥', 'Edit API key')"
       :style="{ width: 'min(520px, calc(100vw - 32px))' }"
     >
       <NForm label-placement="top">
@@ -785,10 +803,10 @@ onMounted(refresh)
           <NButton
             type="primary"
             :loading="isSaving"
-            :disabled="isSaving || (!editingApiKeyHash && !canCreateApiKey)"
+            :disabled="isSaving"
             @click="saveApiKey"
           >
-            {{ editingApiKeyHash ? t('保存', 'Save') : t('创建', 'Create') }}
+            {{ t('保存', 'Save') }}
           </NButton>
         </div>
       </NForm>
