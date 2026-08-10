@@ -160,6 +160,7 @@ func fetchCardShops(ctx context.Context) ([]map[string]any, error) {
 	if shops == nil {
 		shops = []map[string]any{}
 	}
+	normalizeCardShopProductItems(shops)
 	return shops, nil
 }
 
@@ -168,6 +169,121 @@ func cardShopsSourceURL() string {
 		return value
 	}
 	return defaultCardShopsURL
+}
+
+func normalizeCardShopProductItems(shops []map[string]any) {
+	for _, shop := range shops {
+		if shop == nil || hasCardShopProductItems(shop["productItems"]) {
+			continue
+		}
+		productItems := cardShopSummaryPreviewItems(shop["productSummary"])
+		if len(productItems) > 0 {
+			shop["productItems"] = appendMissingCardShopProductNames(productItems, shop["productsInStock"])
+		}
+	}
+}
+
+func hasCardShopProductItems(value any) bool {
+	switch items := value.(type) {
+	case []any:
+		return len(items) > 0
+	case []map[string]any:
+		return len(items) > 0
+	default:
+		return false
+	}
+}
+
+func cardShopSummaryPreviewItems(value any) []map[string]any {
+	summary, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	groups, ok := summary["groups"].([]any)
+	if !ok {
+		return nil
+	}
+
+	productItems := make([]map[string]any, 0)
+	for _, rawGroup := range groups {
+		group, ok := rawGroup.(map[string]any)
+		if !ok {
+			continue
+		}
+		groupName, _ := group["group"].(string)
+		groupName = strings.TrimSpace(groupName)
+		previewItems, ok := group["previewItems"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawItem := range previewItems {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, ok := item["name"].(string)
+			if !ok || strings.TrimSpace(name) == "" {
+				continue
+			}
+			normalizedItem := make(map[string]any, len(item)+1)
+			for key, itemValue := range item {
+				normalizedItem[key] = itemValue
+			}
+			for _, key := range []string{"itemUrl", "category"} {
+				if itemValue, exists := normalizedItem[key]; exists && itemValue != nil {
+					if _, valid := itemValue.(string); !valid {
+						delete(normalizedItem, key)
+					}
+				}
+			}
+			itemGroup, validItemGroup := normalizedItem["group"].(string)
+			if !validItemGroup && normalizedItem["group"] != nil {
+				delete(normalizedItem, "group")
+			}
+			if strings.TrimSpace(itemGroup) == "" && groupName != "" {
+				normalizedItem["group"] = groupName
+			}
+			productItems = append(productItems, normalizedItem)
+		}
+	}
+	return productItems
+}
+
+func appendMissingCardShopProductNames(productItems []map[string]any, value any) []map[string]any {
+	detailNameCounts := make(map[string]int, len(productItems))
+	for _, item := range productItems {
+		name, _ := item["name"].(string)
+		name = strings.TrimSpace(name)
+		if name != "" {
+			detailNameCounts[name]++
+		}
+	}
+
+	appendName := func(name string) {
+		trimmedName := strings.TrimSpace(name)
+		if trimmedName == "" {
+			return
+		}
+		if detailNameCounts[trimmedName] > 0 {
+			detailNameCounts[trimmedName]--
+			return
+		}
+		productItems = append(productItems, map[string]any{"name": name})
+	}
+	switch names := value.(type) {
+	case []any:
+		for _, rawName := range names {
+			name, ok := rawName.(string)
+			if ok {
+				appendName(name)
+			}
+		}
+	case []string:
+		for _, name := range names {
+			appendName(name)
+		}
+	}
+	return productItems
 }
 
 func normalizeCardShopFavoriteKey(value string) (string, error) {

@@ -1344,13 +1344,13 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		unknown := "unknown"
 		apiKey = &unknown
 	}
-	input := toInt(findFirst(parsed, "input_tokens", "prompt_tokens", "promptTokens", "input"))
-	output := toInt(findFirst(parsed, "output_tokens", "completion_tokens", "completionTokens", "output"))
-	cached := toInt(findFirst(parsed, "cached_tokens", "cached_input_tokens", "cached"))
-	cacheRead := toInt(findFirst(parsed, "cache_read_tokens", "cache_read_input_tokens"))
-	cacheCreation := toInt(findFirst(parsed, "cache_creation_tokens", "cache_creation_input_tokens"))
-	reasoning := toInt(findFirst(parsed, "reasoning_tokens", "reasoning"))
-	total := toInt(findFirst(parsed, "total_tokens", "totalTokens", "total"))
+	input := usageToken(parsed, "input_tokens", "prompt_tokens", "promptTokens", "input")
+	output := usageToken(parsed, "output_tokens", "completion_tokens", "completionTokens", "output")
+	cached := usageToken(parsed, "cached_tokens", "cached_input_tokens", "cached")
+	cacheRead := usageToken(parsed, "cache_read_tokens", "cache_read_input_tokens")
+	cacheCreation := usageToken(parsed, "cache_creation_tokens", "cache_creation_input_tokens")
+	reasoning := usageToken(parsed, "reasoning_tokens", "reasoning")
+	total := usageToken(parsed, "total_tokens", "totalTokens", "total")
 	if total == 0 {
 		total = input + output
 		if total == 0 {
@@ -1384,6 +1384,22 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		DedupeKey:           "raw:" + hex.EncodeToString(sum[:]),
 		RawJSON:             string(canonical),
 	}, nil
+}
+
+func usageToken(value any, keys ...string) int {
+	if root, ok := value.(map[string]any); ok {
+		if tokens, ok := root["tokens"].(map[string]any); ok {
+			for _, key := range keys {
+				if token, exists := tokens[key]; exists {
+					switch token.(type) {
+					case float64, string, bool:
+						return toInt(token)
+					}
+				}
+			}
+		}
+	}
+	return toInt(findFirst(value, keys...))
 }
 
 func (a *App) usageOwnerSnapshot(ctx context.Context, apiKeyHash string) (*string, *string, error) {

@@ -1,12 +1,15 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 
 	backendMigrations "cpa-helper/backend/migrations"
+
+	"github.com/pressly/goose/v3"
 )
 
 func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
@@ -320,6 +323,63 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 	}
 	if requestUSD.Valid {
 		t.Fatalf("migrated request_usd = %v, want NULL", requestUSD.Float64)
+	}
+}
+
+func TestRunMigrationsBackfillsUsageTokenBreakdownZeros(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "usage-backfill.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	const previousVersion int64 = 202607060001
+	if err := goose.UpToContext(ctx, db, ".", previousVersion); err != nil {
+		t.Fatalf("migrate to previous version: %v", err)
+	}
+
+	rawJSON := `{"token_breakdown":{"input":{"total_tokens":200955},"output":{"total_tokens":286},"total_tokens":201241},"tokens":{"cached_tokens":198400,"input_tokens":200955,"output_tokens":286,"reasoning_tokens":132,"total_tokens":201241}}`
+	if _, err := db.Exec(`
+		INSERT INTO usage_records (
+			created_at, timestamp, provider, model, failed, input_tokens, output_tokens,
+			cached_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "2026-07-29T20:40:57+08:00", "2026-07-29T20:40:57+08:00", "codex", "gpt-5.6-sol", false, 0, 0, 198400, 132, 201241, "token-breakdown-zero", rawJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{db: db}
+	if err := app.runMigrations(ctx); err != nil {
+		t.Fatalf("runMigrations() failed: %v", err)
+	}
+
+	var inputTokens, outputTokens, totalTokens int
+	var storedRawJSON string
+	if err := db.QueryRow(`
+		SELECT input_tokens, output_tokens, total_tokens, raw_json
+		FROM usage_records WHERE dedupe_key = 'token-breakdown-zero'
+	`).Scan(&inputTokens, &outputTokens, &totalTokens, &storedRawJSON); err != nil {
+		t.Fatal(err)
+	}
+	if inputTokens != 200955 || outputTokens != 286 || totalTokens != 201241 {
+		t.Fatalf("migrated tokens = %d/%d/%d, want 200955/286/201241", inputTokens, outputTokens, totalTokens)
+	}
+	if storedRawJSON != rawJSON {
+		t.Fatal("migration changed raw_json")
+	}
+
+	var version int64
+	if err := db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != backendMigrations.LatestVersion {
+		t.Fatalf("goose version = %d, want %d", version, backendMigrations.LatestVersion)
 	}
 }
 

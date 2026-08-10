@@ -90,6 +90,148 @@ func TestCardShopsProxyReturnsUpstreamShopsForAdmin(t *testing.T) {
 	}
 }
 
+func TestCardShopsProxyNormalizesProductSummaryPreviewItems(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"shops": []map[string]any{
+				{
+					"id":              "summary-shop",
+					"productsInStock": []string{"Codex 摘要商品", "自定义分组商品", "部分字段无效商品", "仅名称商品"},
+					"productItems":    []map[string]any{},
+					"productSummary": map[string]any{
+						"totalCount": 8,
+						"groups": []map[string]any{
+							{
+								"group": "GPT/Codex",
+								"previewItems": []any{
+									map[string]any{
+										"name":       "Codex 摘要商品",
+										"price":      3.5,
+										"stockCount": 9,
+										"salesCount": 12,
+										"itemUrl":    "https://pay.ldxp.cn/item/summary",
+										"category":   "account",
+									},
+									map[string]any{
+										"name":  "自定义分组商品",
+										"group": "Custom",
+									},
+									map[string]any{
+										"name":     "部分字段无效商品",
+										"itemUrl":  42,
+										"category": false,
+										"group":    7,
+									},
+									map[string]any{"name": 123},
+									"invalid-item",
+								},
+							},
+							{
+								"group":        "无效分组",
+								"previewItems": "invalid-preview-items",
+							},
+						},
+					},
+				},
+				{
+					"id": "legacy-shop",
+					"productItems": []map[string]any{
+						{"name": "旧版商品", "price": 6.5},
+					},
+					"productSummary": map[string]any{
+						"groups": []map[string]any{
+							{
+								"group": "摘要分组",
+								"previewItems": []map[string]any{
+									{"name": "不应覆盖旧版商品"},
+								},
+							},
+						},
+					},
+				},
+				{
+					"id":              "fallback-shop",
+					"productsInStock": []string{"仅名称商品"},
+					"productItems":    []map[string]any{},
+					"productSummary":  map[string]any{"groups": "invalid-groups"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+	t.Setenv("CPA_HELPER_CARD_SHOPS_URL", upstream.URL)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+
+	var response struct {
+		Shops []struct {
+			ID           string `json:"id"`
+			ProductItems []struct {
+				Name       string   `json:"name"`
+				Price      *float64 `json:"price"`
+				StockCount *int     `json:"stockCount"`
+				SalesCount *int     `json:"salesCount"`
+				ItemURL    string   `json:"itemUrl"`
+				Category   string   `json:"category"`
+				Group      string   `json:"group"`
+			} `json:"productItems"`
+			ProductSummary struct {
+				TotalCount int `json:"totalCount"`
+			} `json:"productSummary"`
+		} `json:"shops"`
+	}
+	requestJSON(t, handler, http.MethodGet, "/api/card-shops", nil, cookies, &response)
+
+	if len(response.Shops) != 3 {
+		t.Fatalf("shops = %#v, want 3 shops", response.Shops)
+	}
+	summaryShop := response.Shops[0]
+	if summaryShop.ProductSummary.TotalCount != 8 {
+		t.Fatalf("summary total count = %d, want 8", summaryShop.ProductSummary.TotalCount)
+	}
+	if len(summaryShop.ProductItems) != 4 {
+		t.Fatalf("summary product items = %#v, want 3 valid preview items and 1 name fallback", summaryShop.ProductItems)
+	}
+	firstItem := summaryShop.ProductItems[0]
+	if firstItem.Name != "Codex 摘要商品" || firstItem.Price == nil || *firstItem.Price != 3.5 ||
+		firstItem.StockCount == nil || *firstItem.StockCount != 9 ||
+		firstItem.SalesCount == nil || *firstItem.SalesCount != 12 ||
+		firstItem.ItemURL != "https://pay.ldxp.cn/item/summary" || firstItem.Category != "account" ||
+		firstItem.Group != "GPT/Codex" {
+		t.Fatalf("summary product item = %#v, want normalized preview details", firstItem)
+	}
+	if got := summaryShop.ProductItems[1].Group; got != "Custom" {
+		t.Fatalf("explicit item group = %q, want Custom", got)
+	}
+	if got := summaryShop.ProductItems[2]; got.Name != "部分字段无效商品" || got.ItemURL != "" ||
+		got.Category != "" || got.Group != "GPT/Codex" {
+		t.Fatalf("partially invalid product item = %#v, want sanitized strings and inherited group", got)
+	}
+	if got := summaryShop.ProductItems[3]; got.Name != "仅名称商品" || got.Price != nil || got.StockCount != nil {
+		t.Fatalf("name-only fallback item = %#v, want preserved product name without details", got)
+	}
+	if got := response.Shops[1].ProductItems; len(got) != 1 || got[0].Name != "旧版商品" {
+		t.Fatalf("legacy product items = %#v, want original item", got)
+	}
+	if got := response.Shops[2].ProductItems; len(got) != 0 {
+		t.Fatalf("invalid summary product items = %#v, want empty fallback", got)
+	}
+}
+
 func TestCardShopsProxyRequiresAdmin(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	upstreamCalls := 0

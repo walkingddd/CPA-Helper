@@ -128,7 +128,10 @@ const rows = computed<CardShopRow[]>(() => {
 })
 
 const totalProductCount = computed(() =>
-  shops.value.reduce((total, shop) => total + shopProducts(shop).length, 0),
+  shops.value.reduce((total, shop) => {
+    const products = shopProducts(shop)
+    return total + shopProductCount(shop, products)
+  }, 0),
 )
 const favoriteShopCount = computed(() =>
   shops.value.reduce((total, shop, index) => total + (favoriteKeys.value.has(shopKeyForShop(shop, index)) ? 1 : 0), 0),
@@ -612,6 +615,14 @@ function shopProducts(shop: CardShop): CardShopProductItem[] {
   return names.map((name) => ({ name }))
 }
 
+function shopProductCount(shop: CardShop, products: CardShopProductItem[]): number {
+  const summaryCount = numberValue(shop.productSummary?.totalCount)
+  if (summaryCount === null || !Number.isInteger(summaryCount) || summaryCount < products.length) {
+    return products.length
+  }
+  return summaryCount
+}
+
 function searchableProductTitleText(product: CardShopProductItem): string {
   return textValue(product.name).toLowerCase()
 }
@@ -639,7 +650,7 @@ function buildShopRow(shop: CardShop, index: number, queries: string[]): CardSho
     shopKey,
     isFavorite: favoriteKeys.value.has(shopKey),
     visibleProducts,
-    productCount: products.length,
+    productCount: shopProductCount(shop, products),
     matchedProductCount: visibleProducts.length,
     minPrice: minProductPrice(visibleProducts),
     totalStock: visibleProducts.reduce((total, product) => total + (numberValue(product.stockCount) ?? 0), 0),
