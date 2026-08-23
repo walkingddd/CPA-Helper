@@ -866,9 +866,31 @@ function quotaWindowLabels(account: CodexKeeperAccount): { primary: string; seco
     return { primary: t('月限额', 'Monthly Limit'), secondary: t('次限额', 'Secondary Limit') }
   }
   if (isPaidQuotaWindow(account)) {
-    return { primary: t('5小时限额', '5-Hour Limit'), secondary: t('周限额', 'Weekly Limit') }
+    // The upstream usage payload decides the real window length; the plan
+    // type alone does not. Pro accounts, for example, can report a weekly
+    // primary window, so label by actual seconds and only fall back to the
+    // conventional 5-hour/weekly pair when the seconds are unknown.
+    const primaryLabel = quotaWindowLabelForSeconds(quotaWindowSecondsFor(account, 'primary'))
+    const secondaryLabel = quotaWindowLabelForSeconds(quotaWindowSecondsFor(account, 'secondary'))
+    return {
+      primary: primaryLabel ?? t('5小时限额', '5-Hour Limit'),
+      secondary: secondaryLabel ?? t('周限额', 'Weekly Limit'),
+    }
   }
   return { primary: t('主', 'Primary'), secondary: t('次', 'Secondary') }
+}
+
+function quotaWindowLabelForSeconds(seconds: number | null): string | null {
+  if (seconds === CODEX_FIVE_HOUR_WINDOW_SECONDS) {
+    return t('5小时限额', '5-Hour Limit')
+  }
+  if (seconds === CODEX_WEEK_WINDOW_SECONDS) {
+    return t('周限额', 'Weekly Limit')
+  }
+  if (seconds === CODEX_MONTH_WINDOW_SECONDS) {
+    return t('月限额', 'Monthly Limit')
+  }
+  return null
 }
 
 function shouldShowQuotaWindow(account: CodexKeeperAccount): boolean {
