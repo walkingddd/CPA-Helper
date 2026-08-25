@@ -680,7 +680,8 @@ function distributionLegendItems(items: DistributionItem[]): DistributionLegendI
 function formatPercent(value: number): string {
   return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     style: 'percent',
-    maximumFractionDigits: value > 0 && value < 0.1 ? 1 : 0,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
   }).format(value)
 }
 
