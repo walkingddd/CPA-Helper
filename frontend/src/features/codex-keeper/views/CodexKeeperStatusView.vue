@@ -45,6 +45,7 @@ import {
   getCodexKeeperSettings,
   listCodexKeeperAccounts,
   refreshCodexKeeperAccounts,
+  resetCodexKeeperQuota,
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type {
@@ -71,7 +72,7 @@ type AccountListViewMode = 'table' | 'bar' | 'ring'
 type AccountSortKey = 'quotaDay' | 'quotaWeek' | 'accountType' | 'status' | 'priority' | 'lastCheckedAt'
 type SortDirection = 'asc' | 'desc'
 type PriorityMode = 'low' | 'high' | 'default'
-type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh'
+type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh' | 'reset-quota'
 type AccountConfirmType = 'default' | 'warning' | 'error' | 'primary'
 type QuotaWindowItem = {
   label: string
@@ -96,8 +97,8 @@ const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
 const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
-const disabledTableScrollX = 1302
-const normalTableScrollX = 1816
+const disabledTableScrollX = 1568
+const normalTableScrollX = 2072
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
@@ -956,6 +957,27 @@ function formatQuotaResetTime(value: string | null): string | null {
   }).format(date)
 }
 
+// formatQuotaResetCountdown renders a coarse "in N days / N hours" hint relative to now.
+function formatQuotaResetCountdown(value: string | null): string | null {
+  if (!value) {
+    return null
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return null
+  }
+  const diffMs = date.getTime() - Date.now()
+  if (diffMs <= 0) {
+    return t('已到期', 'due')
+  }
+  const days = Math.floor(diffMs / 86400000)
+  if (days >= 1) {
+    return t(`${days}天后`, `in ${days}d`)
+  }
+  const hours = Math.max(1, Math.floor(diffMs / 3600000))
+  return t(`${hours}小时后`, `in ${hours}h`)
+}
+
 function quotaText(account: CodexKeeperAccount): string {
   const items = quotaWindowItems(account)
   if (items.length === 0) {
@@ -1132,6 +1154,29 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
   )
 }
 
+// renderQuotaResetScheduleCell lists each quota window's reset time and countdown
+// (the account's own OpenAI quota-reset schedule, populated by inspection).
+function renderQuotaResetScheduleCell(account: CodexKeeperAccount) {
+  const items = quotaWindowItems(account).filter((item) => item.resetAt)
+  if (items.length === 0) {
+    return '-'
+  }
+  return h(
+    'div',
+    { class: 'quota-reset-schedule-cell' },
+    items.map((item, index) => {
+      const resetTime = formatQuotaResetTime(item.resetAt)
+      const countdown = formatQuotaResetCountdown(item.resetAt)
+      return h('div', { class: 'quota-reset-schedule-item' }, [
+        h('span', { class: 'quota-reset-schedule-label' },
+          t(`第 ${index + 1} 次`, `#${index + 1}`)),
+        h('span', { class: 'quota-reset-schedule-time' }, resetTime ?? '-'),
+        countdown ? h('span', { class: 'quota-reset-schedule-countdown' }, countdown) : null,
+      ])
+    }),
+  )
+}
+
 function renderAccountIdentityCell(account: CodexKeeperAccount) {
   const primary = account.email ?? account.name
   const statusCode = disabledStatusCodeText(account)
@@ -1276,7 +1321,10 @@ function toggleRefreshAccountSelection(account: CodexKeeperAccount) {
 }
 
 function selectAllFilteredRefreshAccounts() {
-  selectedRefreshAccountNames.value = filteredAccountNames.value
+  // Rows with any in-flight action (incl. reset-quota) stay out of bulk selection.
+  selectedRefreshAccountNames.value = filteredAccounts.value
+    .filter((account) => !isRowActing(account))
+    .map((account) => account.name)
 }
 
 function handleAccountCardClick(account: CodexKeeperAccount) {
@@ -1328,7 +1376,11 @@ function openFilteredUnauthorizedDisabledBulkDeleteDialog() {
 }
 
 async function submitBulkDelete() {
-  const authNames = selectedDisabledAccountNames.value
+  // Same row-level fence as bulk refresh: never delete a row mid-action.
+  const authNames = selectedDisabledAccountNames.value.filter((name) => {
+    const account = accounts.value.find((entry) => entry.name === name)
+    return account === undefined || !isRowActing(account)
+  })
   if (authNames.length === 0) {
     return
   }
@@ -1471,6 +1523,28 @@ function confirmDeleteAccount(account: CodexKeeperAccount) {
   )
 }
 
+function resetQuotaAccount(account: CodexKeeperAccount) {
+  return runAccountAction(
+    account,
+    'reset-quota',
+    () => resetCodexKeeperQuota(account.name),
+    t('配额状态已重置', 'Quota state reset'),
+  )
+}
+
+function confirmResetQuota(account: CodexKeeperAccount) {
+  openAccountConfirm(
+    t('重置配额状态', 'Reset Quota State'),
+    t(
+      `重置 ${account.name} 在 CPA 侧的配额/冷却状态？已重置 ${account.quota_reset_count ?? 0} 次。`,
+      `Reset the CPA-side quota/cooldown state of ${account.name}? Reset ${account.quota_reset_count ?? 0} times so far.`,
+    ),
+    t('确认重置', 'Confirm Reset'),
+    'warning',
+    () => resetQuotaAccount(account),
+  )
+}
+
 function enableAccount(account: CodexKeeperAccount) {
   return runAccountAction(
     account,
@@ -1542,17 +1616,17 @@ async function refreshAccounts(
   rawNames: string[],
   options: { closeDetail?: boolean; clearSelection?: boolean } = {},
 ) {
-  const authNames = uniqueAccountNames(rawNames)
-  if (authNames.length === 0) {
-    return
-  }
-  const refreshKeys = authNames
+  // Resolve targets and drop any row that already has an in-flight action
+  // (toggle/priority/delete/refresh/reset-quota) so bulk and programmatic
+  // refreshes respect the same row-level fence as the per-row buttons.
+  const targets = uniqueAccountNames(rawNames)
     .map((name) => accounts.value.find((account) => account.name === name))
-    .filter((account): account is CodexKeeperAccount => account !== undefined)
-    .map((account) => accountActionKey(account, 'refresh'))
-  if (refreshKeys.some((key) => actingActions.value.has(key)) || isBulkRefreshing.value) {
+    .filter((account): account is CodexKeeperAccount => account !== undefined && !isRowActing(account))
+  if (targets.length === 0 || isBulkRefreshing.value) {
     return
   }
+  const authNames = targets.map((account) => account.name)
+  const refreshKeys = targets.map((account) => accountActionKey(account, 'refresh'))
   const nextActions = new Set(actingActions.value)
   refreshKeys.forEach((key) => nextActions.add(key))
   actingActions.value = nextActions
@@ -1590,7 +1664,7 @@ function isActionLoading(account: CodexKeeperAccount, action: AccountAction): bo
 }
 
 function isRowActing(account: CodexKeeperAccount): boolean {
-  return (['toggle', 'priority', 'delete', 'refresh'] as const).some((action) =>
+  return (['toggle', 'priority', 'delete', 'refresh', 'reset-quota'] as const).some((action) =>
     isActionLoading(account, action),
   )
 }
@@ -1656,6 +1730,12 @@ const baseColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
     render: (row) => renderQuotaUsageCell(row),
   },
   {
+    title: t('配额重置窗口', 'Quota Reset Windows'),
+    key: 'quota_reset_schedule',
+    width: 210,
+    render: (row) => renderQuotaResetScheduleCell(row),
+  },
+  {
     title: t('最近巡检', 'Last Inspection'),
     key: 'last_checked_at',
     width: 150,
@@ -1678,7 +1758,7 @@ const disabledBaseColumns = computed<DataTableColumns<CodexKeeperAccount>>(
 const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]>(() => ({
   title: '',
   key: 'actions',
-  width: 224,
+  width: 280,
   fixed: 'right',
   render: (row: CodexKeeperAccount) => {
     return h(
@@ -1727,6 +1807,18 @@ const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[numbe
             },
             { default: () => t('刷新', 'Refresh') },
           ),
+          h(
+            NButton,
+            {
+              size: 'small',
+              quaternary: true,
+              type: 'warning',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'reset-quota'),
+              onClick: () => confirmResetQuota(row),
+            },
+            { default: () => t('重置', 'Reset') },
+          ),
         ],
       },
     )
@@ -1736,7 +1828,7 @@ const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[numbe
 const normalActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]>(() => ({
   title: '',
   key: 'actions',
-  width: 232,
+  width: 288,
   fixed: 'right',
   render: (row: CodexKeeperAccount) => {
     return h(
@@ -1782,6 +1874,18 @@ const normalActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]
               onClick: () => refreshAccount(row),
             },
             { default: () => t('刷新', 'Refresh') },
+          ),
+          h(
+            NButton,
+            {
+              size: 'small',
+              quaternary: true,
+              type: 'warning',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'reset-quota'),
+              onClick: () => confirmResetQuota(row),
+            },
+            { default: () => t('重置', 'Reset') },
           ),
         ],
       },
@@ -3474,6 +3578,34 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+:global(.quota-reset-schedule-cell) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+:global(.quota-reset-schedule-item) {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+:global(.quota-reset-schedule-label) {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+}
+
+:global(.quota-reset-schedule-time) {
+  color: var(--cpa-text);
+}
+
+:global(.quota-reset-schedule-countdown) {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
 }
 
 :global(.quota-window-usage) {

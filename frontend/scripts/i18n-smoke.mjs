@@ -135,6 +135,16 @@ try {
     localizedServerMessage('请求体不是有效 JSON'),
     'Request body is not valid JSON',
   )
+  assert.equal(
+    localizedServerMessage('CLIProxyAPI 未确认重置成功（响应缺少 status=ok 或 auth_index 不匹配）'),
+    'CLIProxyAPI did not confirm the reset (response missing status=ok or auth_index mismatch)',
+  )
+  assert.equal(
+    localizedServerMessage('该账号缺少 auth_index，请先刷新账号列表'),
+    'This account has no auth_index yet; refresh the account list first',
+  )
+  assert.equal(localizedServerMessage('auth_name 不能为空'), 'auth_name must not be empty')
+  assert.equal(localizedServerMessage('账号不存在'), 'Account not found')
   assert.equal(localizedKeeperStatusDetail(null), 'Not running')
 
   const { apiClient } = await server.ssrLoadModule(`/src/shared/api/apiClient.ts?case=${moduleCase++}`)

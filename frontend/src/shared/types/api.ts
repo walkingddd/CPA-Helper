@@ -247,6 +247,8 @@ export interface CodexKeeperAccount {
   latest_action: string | null
   last_checked_at: string | null
   last_healthy_at: string | null
+  quota_reset_count: number
+  last_quota_reset_at: string | null
 }
 
 export interface CodexKeeperAccountsResponse {

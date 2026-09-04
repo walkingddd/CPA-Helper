@@ -76,6 +76,10 @@ export function refreshCodexKeeperAccounts(payload: CodexKeeperRefreshPayload): 
   return apiClient.post<void>('/codex-keeper/accounts/refresh', payload)
 }
 
+export function resetCodexKeeperQuota(authName: string): Promise<void> {
+  return apiClient.post<void>('/codex-keeper/reset-quota', { auth_name: authName })
+}
+
 export function updateCodexKeeperPriority(authName: string, priority: number): Promise<void> {
   return apiClient.patch<void>(`/codex-keeper/accounts/${encodeURIComponent(authName)}/priority`, {
     priority,
