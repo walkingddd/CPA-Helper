@@ -122,3 +122,28 @@ func TestSaveUsageMessageIgnoresZeroTTFT(t *testing.T) {
 		t.Fatalf("stored ttft_ms = %v, want NULL", ttftMS.Float64)
 	}
 }
+
+func TestUsageSummaryCacheHitTokensAcrossProviders(t *testing.T) {
+	claude := "claude"
+	codex := "codex"
+	records := []UsageRecord{
+		// Claude-style: cache reads live outside input_tokens.
+		{Provider: &claude, InputTokens: 100, OutputTokens: 10, CacheReadTokens: 400, CacheCreationTokens: 50},
+		// Codex/OpenAI-style: cached_tokens is a subset of input_tokens.
+		{Provider: &codex, InputTokens: 1000, OutputTokens: 20, CachedTokens: 700, CacheReadTokens: 700, TotalTokens: 1020},
+		// No cache usage at all.
+		{Provider: &codex, InputTokens: 50, OutputTokens: 5, TotalTokens: 55},
+	}
+	summary := usageSummaryFromRecords(UsageFilters{}, records, nil)
+	if got := summary["cache_hit_tokens"]; got != 1100 {
+		t.Fatalf("cache_hit_tokens = %v, want 1100 (claude 400 + codex 700)", got)
+	}
+	// claude input aggregates to 100+400+50=550; codex rows contribute 1000+50.
+	if got := summary["input_tokens"]; got != 1600 {
+		t.Fatalf("input_tokens = %v, want 1600", got)
+	}
+	// cached_tokens keeps its legacy meaning (codex-style only).
+	if got := summary["cached_tokens"]; got != 700 {
+		t.Fatalf("cached_tokens = %v, want 700", got)
+	}
+}

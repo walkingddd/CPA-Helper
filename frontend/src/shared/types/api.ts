@@ -295,6 +295,7 @@ export interface UsageSummary {
   input_tokens: number
   output_tokens: number
   cached_tokens: number
+  cache_hit_tokens: number
   reasoning_tokens: number
   total_tokens: number
   average_ttft_ms: number | null

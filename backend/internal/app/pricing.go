@@ -878,6 +878,16 @@ func usageAggregateInputTokens(record UsageRecord) int {
 	return inputTokens
 }
 
+// usageCacheHitTokens returns the tokens served from provider prompt cache.
+// Claude-style records report cache reads in cache_read_tokens (kept outside
+// input_tokens); everything else reports cached_tokens as a subset of input.
+func usageCacheHitTokens(record UsageRecord) int {
+	if isClaudeProvider(record.Provider) {
+		return nonNegativeTokens(record.CacheReadTokens)
+	}
+	return nonNegativeTokens(record.CachedTokens)
+}
+
 func usageAggregateTotalTokens(record UsageRecord) int {
 	if isClaudeProvider(record.Provider) {
 		return usageAggregateInputTokens(record) + nonNegativeTokens(record.OutputTokens) + nonNegativeTokens(record.ReasoningTokens)

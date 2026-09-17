@@ -856,6 +856,7 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice) map[string]any {
 	failed := 0
 	input, output, cached, reasoning, total := 0, 0, 0, 0, 0
+	cacheHit := 0
 	estimated := 0.0
 	unpriced := 0
 	ttftTotal := 0.0
@@ -867,6 +868,7 @@ func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices
 		input += usageAggregateInputTokens(record)
 		output += record.OutputTokens
 		cached += record.CachedTokens
+		cacheHit += usageCacheHitTokens(record)
 		reasoning += record.ReasoningTokens
 		total += usageAggregateTotalTokens(record)
 		amount, isUnpriced := recordCost(record, prices)
@@ -893,6 +895,7 @@ func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices
 		"input_tokens":       input,
 		"output_tokens":      output,
 		"cached_tokens":      cached,
+		"cache_hit_tokens":   cacheHit,
 		"reasoning_tokens":   reasoning,
 		"total_tokens":       total,
 		"estimated_cost_usd": estimated,
