@@ -53,6 +53,7 @@ import type {
 import { useI18n } from '@/shared/i18n'
 import { copyToClipboard } from '@/shared/utils/clipboard'
 import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/shared/utils/format'
+import { maskApiKey } from '@/shared/utils/maskApiKey'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -364,13 +365,7 @@ function maskDisplayedApiKey(apiKey: string | null | undefined): string {
   if (!apiKey) {
     return t('未知', 'Unknown')
   }
-  if (apiKey.length <= 12) {
-    return `${apiKey.slice(0, 3)}${'*'.repeat(Math.max(apiKey.length - 3, 0))}`
-  }
-  const visiblePrefix = apiKey.startsWith('sk-') ? 4 : 6
-  const visibleSuffix = 4
-  const maskedLength = Math.max(apiKey.length - visiblePrefix - visibleSuffix, 8)
-  return `${apiKey.slice(0, visiblePrefix)}${'*'.repeat(maskedLength)}${apiKey.slice(-visibleSuffix)}`
+  return maskApiKey(apiKey)
 }
 
 function renderMaskedKeyTitle() {

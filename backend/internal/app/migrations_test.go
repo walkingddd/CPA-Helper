@@ -96,6 +96,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "codex_keeper_auth_states", "auth_index") {
 		t.Fatal("codex_keeper_auth_states.auth_index was not created")
 	}
+	if !testColumnExists(t, app.db, "app_settings", "api_key_prefix") {
+		t.Fatal("app_settings.api_key_prefix was not created")
+	}
 	if testColumnExists(t, app.db, "user_quota_charges", "total_deducted_usd") {
 		t.Fatal("old user_quota_charges.total_deducted_usd should not exist")
 	}

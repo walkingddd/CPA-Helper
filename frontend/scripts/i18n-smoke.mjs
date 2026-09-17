@@ -135,6 +135,14 @@ try {
     localizedServerMessage('请求体不是有效 JSON'),
     'Request body is not valid JSON',
   )
+  assert.equal(
+    localizedServerMessage('api_key_prefix 超出最大长度 32'),
+    'api_key_prefix exceeds the maximum length of 32',
+  )
+  assert.equal(
+    localizedServerMessage('api_key_prefix 只能包含字母、数字、- 和 _，且不能以 - 开头或结尾'),
+    'api_key_prefix may only contain letters, digits, - and _, and must not start or end with -',
+  )
   assert.equal(localizedKeeperStatusDetail(null), 'Not running')
 
   const { apiClient } = await server.ssrLoadModule(`/src/shared/api/apiClient.ts?case=${moduleCase++}`)

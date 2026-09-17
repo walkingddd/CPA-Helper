@@ -265,6 +265,7 @@ type settingsUpdateRequest struct {
 	BatchSize            *int     `json:"batch_size"`
 	PollIntervalSeconds  *float64 `json:"poll_interval_seconds"`
 	RetryIntervalSeconds *float64 `json:"retry_interval_seconds"`
+	APIKeyPrefix         *string  `json:"api_key_prefix"`
 }
 
 type modelRequestTestPayload struct {
@@ -349,6 +350,12 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
 			}
 			cfg.Collector.RetryIntervalSeconds = *payload.RetryIntervalSeconds
 		}
+		if payload.APIKeyPrefix != nil {
+			if err := validateAPIKeyPrefix(*payload.APIKeyPrefix); err != nil {
+				return err
+			}
+			cfg.APIKeyPrefix = normalizeAPIKeyPrefix(*payload.APIKeyPrefix)
+		}
 		if err := a.saveConfig(r.Context(), cfg); err != nil {
 			return err
 		}
@@ -371,6 +378,7 @@ func settingsResponse(cfg AppConfig) map[string]any {
 		"batch_size":             collector.BatchSize,
 		"poll_interval_seconds":  collector.PollIntervalSeconds,
 		"retry_interval_seconds": collector.RetryIntervalSeconds,
+		"api_key_prefix":         normalizeAPIKeyPrefix(cfg.APIKeyPrefix),
 	}
 }
 

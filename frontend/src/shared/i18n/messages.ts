@@ -11,6 +11,8 @@ const exactServerMessages: MessagePair[] = [
   ['登录状态缺少角色信息，请重启后端服务后重新登录', 'Your session is missing role information. Restart the backend and sign in again.'],
   ['CPA 配置未完成：请先到「系统设置」填写 CLIProxyAPI 地址和管理密钥，再返回 API 密钥页操作。', 'CPA settings are incomplete. Fill in the CLIProxyAPI URL and management key in System Settings, then return to API Keys.'],
   ['服务器内部错误', 'Internal server error'],
+  ['api_key_prefix 超出最大长度 32', 'api_key_prefix exceeds the maximum length of 32'],
+  ['api_key_prefix 只能包含字母、数字、- 和 _，且不能以 - 开头或结尾', 'api_key_prefix may only contain letters, digits, - and _, and must not start or end with -'],
   ['请求体不是有效 JSON', 'Request body is not valid JSON'],
   ['请先登录', 'Sign in first'],
   ['登录会话已失效', 'Your sign-in session has expired'],

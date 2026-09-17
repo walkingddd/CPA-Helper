@@ -7,7 +7,8 @@
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "vue-tsc -b && vite build",
     "lint": "eslint . --max-warnings=0",
-    "test:i18n": "node scripts/i18n-smoke.mjs"
+    "test:i18n": "node scripts/i18n-smoke.mjs",
+    "test:mask-api-key": "node scripts/mask-api-key-smoke.mjs"
   },
   "dependencies": {
     "echarts": "^5.5.1",

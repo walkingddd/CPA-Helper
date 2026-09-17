@@ -12,7 +12,6 @@ import (
 	"time"
 )
 
-const generatedAPIKeyPrefix = "sk-"
 const generatedAPIKeyLength = 52
 const generatedAPIKeyAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -665,9 +664,15 @@ func (a *App) upsertUserAPIKey(ctx context.Context, userID int, apiKeyHash, apiK
 }
 
 func (a *App) generateUniqueAPIKey(ctx context.Context) (string, error) {
+	// The prefix is a per-deployment setting (e.g. `sk-myteam`); the default keeps the historical
+	// `sk-...` shape. Only keys minted from now on use it — existing keys are never rewritten.
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return "", err
+	}
+	prefix := normalizeAPIKeyPrefix(cfg.APIKeyPrefix)
 	for i := 0; i < 10; i++ {
 		var builder strings.Builder
-		builder.WriteString(generatedAPIKeyPrefix)
 		for j := 0; j < generatedAPIKeyLength; j++ {
 			index, err := rand.Int(rand.Reader, big.NewInt(int64(len(generatedAPIKeyAlphabet))))
 			if err != nil {
@@ -675,7 +680,7 @@ func (a *App) generateUniqueAPIKey(ctx context.Context) (string, error) {
 			}
 			builder.WriteByte(generatedAPIKeyAlphabet[index.Int64()])
 		}
-		apiKey := builder.String()
+		apiKey := buildAPIKey(prefix, builder.String())
 		var count int
 		if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_api_keys WHERE api_key_hash = ?`, hashAPIKey(apiKey)).Scan(&count); err != nil {
 			return "", err
