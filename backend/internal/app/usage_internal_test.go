@@ -122,3 +122,71 @@ func TestSaveUsageMessageIgnoresZeroTTFT(t *testing.T) {
 		t.Fatalf("stored ttft_ms = %v, want NULL", ttftMS.Float64)
 	}
 }
+
+func TestWarmPriceMap(t *testing.T) {
+	prices := map[[2]string]ModelPrice{
+		{"openai", "gpt-5.2"}: {
+			Provider:           "openai",
+			Model:              "gpt-5.2",
+			InputUSDPerMillion: 0.1,
+		},
+	}
+	provider := "codex"
+	model := "gpt-5.2"
+	records := []UsageRecord{
+		{Provider: &provider, Model: &model},
+	}
+	warmPriceMap(prices, records)
+	key := priceKey(provider, model)
+	cached, ok := prices[key]
+	if !ok {
+		t.Fatalf("expected prices to be warmed for codex/gpt-5.2")
+	}
+	if cached.InputUSDPerMillion != 0.1 {
+		t.Fatalf("cached InputUSDPerMillion = %v, want 0.1", cached.InputUSDPerMillion)
+	}
+}
+
+func TestUsageOptionsFromRecordsMatchesAdmin(t *testing.T) {
+	provider := "openai"
+	model := "gpt-5.5"
+	endpoint := "/v1/chat/completions"
+	desc := "dev-key"
+	username := "alice"
+	source := "user@gmail.com"
+	auth := "oauth"
+
+	records := []UsageRecord{
+		{
+			Provider:           &provider,
+			Model:              &model,
+			Endpoint:           &endpoint,
+			APIKeyDescription:  &desc,
+			UsageUsername:      &username,
+			Source:             &source,
+			Auth:               &auth,
+		},
+	}
+	userLookup := map[string]userInfo{
+		"alice": {ID: 42, Name: "Alice In Wonderland"},
+	}
+	scope := usageAccessScope{IsAdmin: true}
+	options := usageOptionsFromRecords(records, userLookup, scope)
+
+	users, ok := options["users"].([]map[string]any)
+	if !ok || len(users) != 1 || users[0]["label"] != "Alice In Wonderland" {
+		t.Fatalf("options users = %#v, want 1 user Alice", options["users"])
+	}
+	providers, ok := options["providers"].([]string)
+	if !ok || len(providers) != 1 || providers[0] != "openai" {
+		t.Fatalf("options providers = %#v, want [openai]", options["providers"])
+	}
+	models, ok := options["models"].([]string)
+	if !ok || len(models) != 1 || models[0] != "gpt-5.5" {
+		t.Fatalf("options models = %#v, want [gpt-5.5]", options["models"])
+	}
+	sources, ok := options["sources"].([]map[string]string)
+	if !ok || len(sources) != 1 || sources[0]["label"] != "user@gmail.com" {
+		t.Fatalf("options sources = %#v, want 1 source user@gmail.com", options["sources"])
+	}
+}

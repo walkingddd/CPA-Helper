@@ -935,6 +935,7 @@ func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSumma
 	if err != nil {
 		return nil, err
 	}
+	warmPriceMap(prices, records)
 	todayStart, todayEnd := defaultTodayRange()
 	result := map[string]userUsageSummary{}
 	providerSeen := map[string]map[string]bool{}

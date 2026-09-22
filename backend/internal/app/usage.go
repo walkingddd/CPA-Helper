@@ -249,6 +249,156 @@ func (a *App) scopedFilters(ctx context.Context, filters UsageFilters, scope usa
 	return filters, nil
 }
 
+func hasUsageSubFilters(filters UsageFilters) bool {
+	return filters.UserID != nil ||
+		filters.APIKeyDescription != nil ||
+		filters.Provider != nil ||
+		filters.Model != nil ||
+		filters.SourceKey != nil ||
+		filters.Endpoint != nil ||
+		filters.Failed != nil ||
+		filters.RequestID != nil
+}
+
+func warmPriceMap(prices map[[2]string]ModelPrice, records []UsageRecord) {
+	if len(prices) == 0 || len(records) == 0 {
+		return
+	}
+	seen := make(map[[2]string]struct{}, 16)
+	for _, r := range records {
+		if r.Provider == nil || r.Model == nil {
+			continue
+		}
+		k := priceKey(*r.Provider, *r.Model)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		if _, ok := prices[k]; !ok {
+			if matched := findMatchingPrice(prices, r.Provider, r.Model); matched != nil {
+				prices[k] = *matched
+			}
+		}
+	}
+}
+
+func usageOptionsFromRecords(records []UsageRecord, userLookup map[string]userInfo, scope usageAccessScope) map[string]any {
+	providerSeen := make(map[string]struct{})
+	modelSeen := make(map[string]struct{})
+	endpointSeen := make(map[string]struct{})
+	descSeen := make(map[string]struct{})
+	userSeen := make(map[string]struct{})
+	type sourceOption struct {
+		Key   string
+		Label string
+	}
+	sourceSeen := make(map[string]sourceOption)
+
+	for _, r := range records {
+		if r.Provider != nil && *r.Provider != "" {
+			providerSeen[*r.Provider] = struct{}{}
+		}
+		if r.Model != nil && *r.Model != "" {
+			modelSeen[*r.Model] = struct{}{}
+		}
+		if r.Endpoint != nil && *r.Endpoint != "" {
+			endpointSeen[*r.Endpoint] = struct{}{}
+		}
+		if r.APIKeyDescription != nil && *r.APIKeyDescription != "" {
+			descSeen[*r.APIKeyDescription] = struct{}{}
+		}
+		if scope.IsAdmin {
+			if r.UsageUsername != nil && *r.UsageUsername != "" {
+				userSeen[*r.UsageUsername] = struct{}{}
+			}
+			if r.Source != nil && *r.Source != "" {
+				sourceValue := *r.Source
+				displaySource := redactedUsageSource(&sourceValue, r.Auth, usageRedactionOptions{})
+				sourceKey := usageSourceKey(&sourceValue)
+				if displaySource != nil && sourceKey != nil {
+					existing, ok := sourceSeen[*sourceKey]
+					if !ok || (existing.Label == sourceValue && *displaySource != sourceValue) {
+						sourceSeen[*sourceKey] = sourceOption{Key: *sourceKey, Label: *displaySource}
+					}
+				}
+			}
+		}
+	}
+
+	users := []map[string]any{}
+	if scope.IsAdmin {
+		usernames := make([]string, 0, len(userSeen))
+		for u := range userSeen {
+			usernames = append(usernames, u)
+		}
+		sort.Strings(usernames)
+		for _, username := range usernames {
+			if info, ok := userLookup[username]; ok {
+				id := info.ID
+				users = append(users, rankingItem(strconv.Itoa(id), info.Name, 0, 0, 0, 0, &id, nil))
+			}
+		}
+	}
+
+	providers := make([]string, 0, len(providerSeen))
+	for p := range providerSeen {
+		providers = append(providers, p)
+	}
+	sort.Strings(providers)
+
+	models := make([]string, 0, len(modelSeen))
+	for m := range modelSeen {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+
+	sources := []map[string]string{}
+	if scope.IsAdmin {
+		sourceOptions := make([]sourceOption, 0, len(sourceSeen))
+		for _, opt := range sourceSeen {
+			sourceOptions = append(sourceOptions, opt)
+		}
+		sort.Slice(sourceOptions, func(i, j int) bool {
+			if sourceOptions[i].Label == sourceOptions[j].Label {
+				return sourceOptions[i].Key < sourceOptions[j].Key
+			}
+			return sourceOptions[i].Label < sourceOptions[j].Label
+		})
+		for _, opt := range sourceOptions {
+			sources = append(sources, map[string]string{
+				"key":   opt.Key,
+				"label": opt.Label,
+			})
+		}
+	}
+
+	endpoints := make([]string, 0, len(endpointSeen))
+	for ep := range endpointSeen {
+		endpoints = append(endpoints, ep)
+	}
+	sort.Strings(endpoints)
+
+	descriptions := make([]string, 0, len(descSeen))
+	for d := range descSeen {
+		descriptions = append(descriptions, d)
+	}
+	sort.Strings(descriptions)
+
+	descriptionItems := make([]map[string]any, 0, len(descriptions))
+	for _, desc := range descriptions {
+		descriptionItems = append(descriptionItems, rankingItem(desc, desc, 0, 0, 0, 0, nil, &desc))
+	}
+
+	return map[string]any{
+		"users":                 users,
+		"providers":             providers,
+		"models":                models,
+		"sources":               sources,
+		"endpoints":             endpoints,
+		"api_key_descriptions": descriptionItems,
+	}
+}
+
 func (a *App) usageSummary(w http.ResponseWriter, r *http.Request, filters UsageFilters, user *AuthUser) error {
 	scope := accessScope(user, filters.Scope)
 	scoped, err := a.scopedFilters(r.Context(), normalizedUsageFilters(filters), scope)
@@ -350,6 +500,7 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
+	warmPriceMap(prices, records)
 	users, err := a.userLookup(r.Context(), scope)
 	if err != nil {
 		return err
@@ -359,9 +510,14 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if scope.IsAdmin {
 		userRanking = rankingFromRecords(records, prices, "user", users)
 	}
-	options, err := a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
-	if err != nil {
-		return err
+	var options map[string]any
+	if !hasUsageSubFilters(filters) {
+		options = usageOptionsFromRecords(records, users, scope)
+	} else {
+		options, err = a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
+		if err != nil {
+			return err
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"summary":                     usageSummaryFromRecords(scoped, records, prices),
@@ -488,7 +644,7 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 		return values, rows.Err()
 	}
 	distinctSourceOptions := func() ([]map[string]string, error) {
-		rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, auth, raw_json FROM usage_records `+where+` AND source IS NOT NULL`, args...)
+		rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, auth FROM usage_records `+where+` AND source IS NOT NULL`, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -499,20 +655,21 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 		}
 		values := map[string]sourceOption{}
 		for rows.Next() {
-			var source, auth, rawJSON sql.NullString
-			if err := rows.Scan(&source, &auth, &rawJSON); err != nil {
+			var source, auth sql.NullString
+			if err := rows.Scan(&source, &auth); err != nil {
 				return nil, err
 			}
 			sourceValue := strings.TrimSpace(source.String)
 			if !source.Valid || sourceValue == "" {
 				continue
 			}
-			record := UsageRecord{Source: &sourceValue, RawJSON: rawJSON.String}
-			if auth.Valid {
-				record.Auth = &auth.String
+			var authPtr *string
+			if auth.Valid && strings.TrimSpace(auth.String) != "" {
+				s := strings.TrimSpace(auth.String)
+				authPtr = &s
 			}
-			displaySource := redactedUsageSource(record.Source, usageRecordAuth(record), usageRedactionOptions{})
-			sourceKey := usageSourceKey(record.Source)
+			displaySource := redactedUsageSource(&sourceValue, authPtr, usageRedactionOptions{})
+			sourceKey := usageSourceKey(&sourceValue)
 			if displaySource == nil || sourceKey == nil {
 				continue
 			}
@@ -606,7 +763,7 @@ func (a *App) filteredUsageRecords(ctx context.Context, filters UsageFilters, or
 	where, args := usageWhere(filters)
 	query := `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
 		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
-		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records ` + where
+		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, '' AS raw_json FROM usage_records ` + where
 	if strings.TrimSpace(orderBy) != "" {
 		query += " ORDER BY " + orderBy
 	} else {

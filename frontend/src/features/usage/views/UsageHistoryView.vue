@@ -85,7 +85,7 @@ interface HourActivityItem {
   tokenStyle: Record<string, string>
 }
 
-const AUTO_REFRESH_INTERVAL_MS = 5000
+const AUTO_REFRESH_INTERVAL_MS = 15000
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
 const THIRTY_MINUTES_MS = 30 * 60 * 1000
@@ -333,7 +333,7 @@ const refreshStatusText = computed(() => {
   if (!lastRefreshTime) {
     return autoRefreshError.value
       ? t('自动刷新异常 · 尚无成功同步', 'Auto refresh error · no successful sync yet')
-      : t('每 5 秒自动刷新 · 等待首次同步', 'Auto refresh every 5 seconds · waiting for first sync')
+      : t('每 15 秒自动刷新 · 等待首次同步', 'Auto refresh every 15 seconds · waiting for first sync')
   }
   const lastRefreshText = new Intl.DateTimeFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     hour: '2-digit',
@@ -346,7 +346,7 @@ const refreshStatusText = computed(() => {
   if (auxiliaryError.value) {
     return t(`已同步 ${lastRefreshText} · 辅助指标降级`, `Synced ${lastRefreshText} · auxiliary metrics degraded`)
   }
-  return t(`每 5 秒自动刷新 · 最近 ${lastRefreshText}`, `Auto refresh every 5 seconds · latest ${lastRefreshText}`)
+  return t(`每 15 秒自动刷新 · 最近 ${lastRefreshText}`, `Auto refresh every 15 seconds · latest ${lastRefreshText}`)
 })
 
 const dashboardRangeLabel = computed(() => {
@@ -507,12 +507,22 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     const usedServerDefaultRange = filters.start === undefined && filters.end === undefined
     const [todayStart, todayEnd] = todayRange()
     const [realtimeStart, realtimeEnd] = rollingRange(THIRTY_MINUTES_MS)
+    const isTodayRange =
+      activeQuickRange.value === 'today' ||
+      (filters.start === formatLocalDateTimeParam(todayStart) &&
+        filters.end === formatLocalDateTimeParam(todayEnd))
+
     const todayFilters: UsageFilters = {
       ...filters,
       start: formatLocalDateTimeParam(todayStart),
       end: formatLocalDateTimeParam(todayEnd),
     }
     const failedFilters: UsageFilters = { ...filters, failed: true }
+    const todayRequest = isTodayRange
+      ? Promise.resolve(null)
+      : getUsageOverview(todayFilters)
+    const failedRequest =
+      filters.failed === false ? Promise.resolve(null) : getUsageOverview(failedFilters)
     const realtimeRequest =
       activeQuickRange.value === 'today'
         ? getUsageOverview({
@@ -525,8 +535,8 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     const [overviewResult, todayResult, failedResult, realtimeResult, quotaResult] =
       await Promise.allSettled([
         getUsageOverview(filters),
-        getUsageOverview(todayFilters),
-        getUsageOverview(failedFilters),
+        todayRequest,
+        failedRequest,
         realtimeRequest,
         quotaRequest,
       ] as const)
@@ -551,13 +561,15 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     distributions.value = normalizeUsageDistributions(overview.distributions)
     options.value = normalizeUsageOptions(overview.options)
 
-    if (todayResult.status === 'fulfilled') {
+    if (isTodayRange) {
+      todayTrends.value = overview.trends
+    } else if (todayResult.status === 'fulfilled' && todayResult.value) {
       todayTrends.value = todayResult.value.trends
     } else {
       todayTrends.value = []
     }
 
-    if (failedResult.status === 'fulfilled') {
+    if (failedResult.status === 'fulfilled' && failedResult.value) {
       failedSummary.value = failedResult.value.summary
       failedTrends.value = failedResult.value.trends
       failedEndpointDistribution.value = failedResult.value.distributions.endpoints ?? []
@@ -580,21 +592,23 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     }
 
     auxiliaryError.value =
-      todayResult.status === 'rejected' ||
-      failedResult.status === 'rejected' ||
+      (!isTodayRange && todayResult.status === 'rejected') ||
+      (filters.failed !== false && failedResult.status === 'rejected') ||
       realtimeResult.status === 'rejected' ||
       quotaResult.status === 'rejected'
         ? t('部分辅助指标加载失败', 'Some auxiliary metrics failed to load')
         : null
 
-    void router.replace({
-      query: filtersToQuery(
-        usedServerDefaultRange
-          ? { ...filters, start: overview.summary.start, end: overview.summary.end }
-          : filters,
-        activeQuickRange.value,
-      ),
-    })
+    if (!silent || usedServerDefaultRange) {
+      void router.replace({
+        query: filtersToQuery(
+          usedServerDefaultRange
+            ? { ...filters, start: overview.summary.start, end: overview.summary.end }
+            : filters,
+          activeQuickRange.value,
+        ),
+      })
+    }
     autoRefreshError.value = null
     lastRefreshedAt.value = new Date()
   } catch (error) {
@@ -1165,17 +1179,31 @@ const endpointDistributionOption = computed<ChartOption>(() =>
 
 let autoRefreshTimer: number | undefined
 
+function handleVisibilityChange() {
+  if (document.hidden) {
+    return
+  }
+  const lastTime = lastRefreshedAt.value ? lastRefreshedAt.value.getTime() : 0
+  if (Date.now() - lastTime >= AUTO_REFRESH_INTERVAL_MS) {
+    void refresh({ silent: true })
+  }
+}
+
 onMounted(() => {
   void refresh()
   autoRefreshTimer = window.setInterval(() => {
-    void refresh({ silent: true })
+    if (!document.hidden) {
+      void refresh({ silent: true })
+    }
   }, AUTO_REFRESH_INTERVAL_MS)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
 onBeforeUnmount(() => {
   if (autoRefreshTimer !== undefined) {
     window.clearInterval(autoRefreshTimer)
   }
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>
 
