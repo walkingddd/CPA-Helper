@@ -757,17 +757,29 @@ func (a *App) collectorState(ctx context.Context) (collectorState, error) {
 	return state, nil
 }
 
-func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
+func (a *App) apiKeySyncConfig(ctx context.Context) (AppConfig, error) {
 	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
+		return AppConfig{}, validationError(apiKeySyncMissingConfigMessage)
+	}
+	return cfg, nil
+}
+
+func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
+	cfg, err := a.apiKeySyncConfig(ctx)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
-		return validationError(apiKeySyncMissingConfigMessage)
-	}
+	return a.addRemoteAPIKeyWithConfig(ctx, cfg, apiKey)
+}
+
+func (a *App) addRemoteAPIKeyWithConfig(ctx context.Context, cfg AppConfig, apiKey string) error {
 	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
 	defer cancel()
-	unsupported, err := a.patchRemoteAPIKey(syncCtx, cfg, apiKey)
+	unsupported, err := a.patchRemoteAPIKey(syncCtx, cfg, apiKey, apiKey)
 	if err != nil {
 		return err
 	}
@@ -788,13 +800,14 @@ func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
 }
 
 func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) error {
-	cfg, err := a.loadConfig(ctx)
+	cfg, err := a.apiKeySyncConfig(ctx)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
-		return validationError(apiKeySyncMissingConfigMessage)
-	}
+	return a.removeRemoteAPIKeyHashWithConfig(ctx, cfg, apiKeyHash)
+}
+
+func (a *App) removeRemoteAPIKeyHashWithConfig(ctx context.Context, cfg AppConfig, apiKeyHash string) error {
 	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
 	defer cancel()
 	keys, err := a.remoteAPIKeys(syncCtx, cfg)
@@ -814,6 +827,45 @@ func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) err
 		return nil
 	}
 	return a.putRemoteAPIKeys(syncCtx, cfg, next)
+}
+
+func (a *App) replaceRemoteAPIKey(ctx context.Context, cfg AppConfig, oldHash, apiKey string) (func(context.Context) error, error) {
+	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
+	defer cancel()
+	keys, err := a.remoteAPIKeys(syncCtx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	// CPA expects an array when restoring an originally empty key list.
+	keys = append([]string{}, keys...)
+	oldKey := apiKey
+	next := make([]string, 0, len(keys)+1)
+	replaced := false
+	for _, key := range keys {
+		if key == apiKey {
+			return nil, conflictError("API KEY 已存在，请使用其他值")
+		}
+		if hashAPIKey(key) == oldHash {
+			oldKey = key
+			if !replaced {
+				next = append(next, apiKey)
+			}
+			replaced = true
+		} else {
+			next = append(next, key)
+		}
+	}
+	if !replaced {
+		next = append(next, apiKey)
+	}
+	undo := func(rollbackCtx context.Context) error {
+		return a.putRemoteAPIKeys(rollbackCtx, cfg, keys)
+	}
+	unsupported, err := a.patchRemoteAPIKey(syncCtx, cfg, oldKey, apiKey)
+	if err == nil && unsupported {
+		err = a.putRemoteAPIKeys(syncCtx, cfg, next)
+	}
+	return undo, err
 }
 
 func (a *App) remoteAPIKeys(ctx context.Context, cfg AppConfig) ([]string, error) {
@@ -838,8 +890,8 @@ func (a *App) putRemoteAPIKeys(ctx context.Context, cfg AppConfig, keys []string
 	return nil
 }
 
-func (a *App) patchRemoteAPIKey(ctx context.Context, cfg AppConfig, apiKey string) (bool, error) {
-	payload := map[string]string{"old": apiKey, "new": apiKey}
+func (a *App) patchRemoteAPIKey(ctx context.Context, cfg AppConfig, oldKey, apiKey string) (bool, error) {
+	payload := map[string]string{"old": oldKey, "new": apiKey}
 	response, _, err := doJSON(ctx, httpClient(apiKeySyncTimeout), http.MethodPatch, makeURL(cfg.Collector.CLIProxyURL, "/v0/management/api-keys", nil), managementHeaders(cfg.Collector.ManagementKey), payload)
 	if err != nil {
 		return false, remoteAPIKeyError("写入 CPA API KEY", err)

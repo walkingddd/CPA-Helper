@@ -132,6 +132,22 @@ try {
     'API key description is required',
   )
   assert.equal(
+    localizedApiErrorMessage('conflict', 'API KEY 已存在，请使用其他值'),
+    'This API key already exists. Use a different value.',
+  )
+  assert.equal(
+    localizedApiErrorMessage('validation_error', 'API KEY 不能超过 400 个字符'),
+    'API key must not exceed 400 characters',
+  )
+  assert.equal(
+    localizedApiErrorMessage('validation_error', 'API KEY 只能包含可见 ASCII 字符，不能包含空格或控制字符'),
+    'API key must contain only visible ASCII characters, without spaces or control characters',
+  )
+  assert.equal(
+    localizedApiErrorMessage('validation_error', 'API KEY 保存失败，且 CPA 回滚失败，请联系管理员检查密钥配置'),
+    'Saving the API key and rolling back CPA both failed. Contact an admin to check the key configuration.',
+  )
+  assert.equal(
     localizedServerMessage('请求体不是有效 JSON'),
     'Request body is not valid JSON',
   )

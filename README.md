@@ -124,6 +124,8 @@ Each user can inspect request events and details scoped to their own account, se
 
 **API keys**
 
+Enter a custom API key when creating a key, or leave it blank to generate one. When editing, enter a replacement key or leave it blank to keep the current value. The description and historical usage remain associated with the account; update your clients after replacing a key.
+
 Each account can independently create and manage its own API keys, review daily request, token, cost and balance summaries, and generate examples or run a live test request for each key.
 
 ![API keys](pictures/API密钥.png)

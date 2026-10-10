@@ -30,7 +30,8 @@ type userAPIKeyBindPayload struct {
 }
 
 type apiKeyPayload struct {
-	Description string `json:"description"`
+	APIKey      string  `json:"api_key"`
+	Description *string `json:"description"`
 }
 
 type UserRecord struct {
@@ -282,7 +283,7 @@ func (a *App) handleCurrentUserAPIKeys(w http.ResponseWriter, r *http.Request) e
 		if err := decodeJSON(r, &payload); err != nil {
 			return err
 		}
-		summary, err := a.createGeneratedAPIKeyForUser(r.Context(), user.ID, user.Username, payload.Description)
+		summary, err := a.createAPIKeyForUser(r.Context(), user.ID, user.Username, payload)
 		if err != nil {
 			return err
 		}
@@ -308,7 +309,7 @@ func (a *App) handleCurrentUserAPIKeyByHash(w http.ResponseWriter, r *http.Reque
 		if err := decodeJSON(r, &payload); err != nil {
 			return err
 		}
-		summary, err := a.updateCurrentUserAPIKey(r.Context(), user, apiKeyHash, payload.Description)
+		summary, err := a.updateCurrentUserAPIKey(r.Context(), user, apiKeyHash, payload)
 		if err != nil {
 			return err
 		}
@@ -580,61 +581,6 @@ func (a *App) currentUserAPIKeys(ctx context.Context, user *AuthUser) ([]UserApi
 		}
 	}
 	return result, nil
-}
-
-func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, username, description string) (UserApiKeySummary, error) {
-	description = strings.TrimSpace(description)
-	if description == "" {
-		return UserApiKeySummary{}, validationError("API KEY 描述不能为空")
-	}
-	user, err := a.getActiveUser(ctx, userID)
-	if err != nil {
-		return UserApiKeySummary{}, err
-	}
-	if err := a.ensureUserQuotaReadyForKeys(ctx, user.ID); err != nil {
-		return UserApiKeySummary{}, err
-	}
-	apiKey, err := a.generateUniqueAPIKey(ctx)
-	if err != nil {
-		return UserApiKeySummary{}, err
-	}
-	if err := a.addRemoteAPIKey(ctx, apiKey); err != nil {
-		return UserApiKeySummary{}, err
-	}
-	apiKeyHash := hashAPIKey(apiKey)
-	if err := a.upsertUserAPIKey(ctx, user.ID, apiKeyHash, apiKey, description); err != nil {
-		_ = a.removeRemoteAPIKeyHash(ctx, apiKeyHash)
-		return UserApiKeySummary{}, err
-	}
-	summary, err := a.keySummaryByHash(ctx, apiKeyHash, &apiKey)
-	if err != nil {
-		return UserApiKeySummary{}, err
-	}
-	summary.UserName = &username
-	return summary, nil
-}
-
-func (a *App) updateCurrentUserAPIKey(ctx context.Context, user *AuthUser, apiKeyHash, description string) (UserApiKeySummary, error) {
-	description = strings.TrimSpace(description)
-	if description == "" {
-		return UserApiKeySummary{}, validationError("API KEY 描述不能为空")
-	}
-	result, err := a.db.ExecContext(ctx, `UPDATE user_api_keys SET description = ?, updated_at = ? WHERE user_id = ? AND api_key_hash = ?`, description, dbTime(time.Now()), user.ID, apiKeyHash)
-	if err != nil {
-		return UserApiKeySummary{}, err
-	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		return UserApiKeySummary{}, notFoundError("API KEY 不存在")
-	}
-	_, _ = a.db.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, dbTime(time.Now()), user.ID)
-	summary, err := a.keySummaryByHash(ctx, apiKeyHash, nil)
-	if err != nil {
-		return UserApiKeySummary{}, err
-	}
-	name := user.Username
-	summary.UserName = &name
-	return summary, nil
 }
 
 func (a *App) deleteCurrentUserAPIKey(ctx context.Context, user *AuthUser, apiKeyHash string) error {

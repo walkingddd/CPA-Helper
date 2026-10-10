@@ -186,6 +186,7 @@ const serverTermTranslations: MessagePair[] = [
 ]
 
 const serverMessagePatterns: ServerMessagePattern[] = [
+  [/^API KEY 不能超过 400 个字符$/, () => 'API key must not exceed 400 characters'],
   [/^操作失败$/, () => 'Operation failed'],
   [/^加载(.+)失败$/, ([, subject]) => `Failed to load ${translateTerms(subject ?? '')}`],
   [/^保存(.+)失败$/, ([, subject]) => `Failed to save ${translateTerms(subject ?? '')}`],
@@ -228,6 +229,9 @@ const serverMessagePatterns: ServerMessagePattern[] = [
   [/^API KEY 或 API KEY 标识不能为空$/, () => 'API key or API key identifier is required'],
   [/^未找到完整 API KEY，请粘贴原始 API KEY$/, () => 'Full API key was not found. Paste the original API key.'],
   [/^生成 API KEY 失败，请重试$/, () => 'Failed to generate API key. Try again.'],
+  [/^API KEY 已存在，请使用其他值$/, () => 'This API key already exists. Use a different value.'],
+  [/^API KEY 只能包含可见 ASCII 字符，不能包含空格或控制字符$/, () => 'API key must contain only visible ASCII characters, without spaces or control characters'],
+  [/^API KEY 保存失败，且 CPA 回滚失败，请联系管理员检查密钥配置$/, () => 'Saving the API key and rolling back CPA both failed. Contact an admin to check the key configuration.'],
   [/^第一个用户不能禁用$/, () => 'The first user cannot be disabled'],
   [/^账号不允许修改$/, () => 'Account cannot be changed'],
   [/^第一个管理员账号不能取消管理员权限$/, () => 'The first admin account cannot lose admin access'],

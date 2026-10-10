@@ -621,9 +621,11 @@ export interface UserApiKeyBindPayload {
 }
 
 export interface ApiKeyCreatePayload {
+  api_key?: string
   description: string
 }
 
 export interface ApiKeyUpdatePayload {
-  description: string
+  api_key?: string
+  description?: string
 }
