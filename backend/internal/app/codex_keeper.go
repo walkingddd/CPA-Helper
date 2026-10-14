@@ -110,6 +110,10 @@ type keeperPriorityUpdateRequest struct {
 	Priority int `json:"priority"`
 }
 
+type keeperQuotaResetRequest struct {
+	AuthName string `json:"auth_name"`
+}
+
 type keeperAccount struct {
 	Name                   string     `json:"name"`
 	Email                  *string    `json:"email"`
@@ -125,6 +129,8 @@ type keeperAccount struct {
 	SecondaryWindowSeconds *int       `json:"secondary_window_seconds"`
 	QuotaThreshold         *int       `json:"quota_threshold"`
 	LastStatusCode         *int       `json:"last_status_code"`
+	QuotaResetCount        int        `json:"quota_reset_count"`
+	LastQuotaResetAt       *time.Time `json:"last_quota_reset_at"`
 	LastError              *string    `json:"last_error"`
 	LatestAction           *string    `json:"latest_action"`
 	LastCheckedAt          *time.Time `json:"last_checked_at"`
@@ -151,6 +157,8 @@ type keeperAccountResponse struct {
 	LatestAction           *string                         `json:"latest_action"`
 	LastCheckedAt          *string                         `json:"last_checked_at"`
 	LastHealthyAt          *string                         `json:"last_healthy_at"`
+	QuotaResetCount        int                             `json:"quota_reset_count"`
+	LastQuotaResetAt       *string                         `json:"last_quota_reset_at"`
 }
 
 type keeperQuotaWindowUsageResponse struct {
@@ -891,6 +899,23 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		}
 		writeJSON(w, http.StatusOK, a.keeper.Status())
 		return nil
+	case len(parts) == 1 && parts[0] == "reset-quota":
+		if err := requireMethod(r, http.MethodPost); err != nil {
+			return err
+		}
+		var payload keeperQuotaResetRequest
+		if err := decodeJSON(r, &payload); err != nil {
+			return err
+		}
+		if strings.TrimSpace(payload.AuthName) == "" {
+			return validationError("auth_name 不能为空")
+		}
+		result, err := a.resetKeeperQuota(r.Context(), strings.TrimSpace(payload.AuthName))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": result})
+		return nil
 	case len(parts) == 1 && parts[0] == "accounts":
 		if err := requireMethod(r, http.MethodGet); err != nil {
 			return err
@@ -1054,6 +1079,8 @@ func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]ke
 			LatestAction:           account.LatestAction,
 			LastCheckedAt:          apiDateTimePtr(account.LastCheckedAt),
 			LastHealthyAt:          apiDateTimePtr(account.LastHealthyAt),
+			QuotaResetCount:        account.QuotaResetCount,
+			LastQuotaResetAt:       apiDateTimePtr(account.LastQuotaResetAt),
 		})
 	}
 	return responses
@@ -2840,7 +2867,118 @@ func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 		}
 		accounts = append(accounts, state.keeperAccount)
 	}
-	return accounts, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := a.mergeKeeperQuotaResetCounts(ctx, accounts); err != nil {
+		return nil, err
+	}
+	return accounts, nil
+}
+
+// mergeKeeperQuotaResetCounts fills QuotaResetCount/LastQuotaResetAt from the
+// codex_keeper_quota_resets table (rows without an entry keep the zero count).
+func (a *App) mergeKeeperQuotaResetCounts(ctx context.Context, accounts []keeperAccount) error {
+	if len(accounts) == 0 {
+		return nil
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT auth_name, reset_count, CAST(last_reset_at AS TEXT) FROM codex_keeper_quota_resets`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type resetInfo struct {
+		count  int
+		lastAt *time.Time
+	}
+	counts := map[string]resetInfo{}
+	for rows.Next() {
+		var name string
+		var count int
+		var lastAt sql.NullString
+		if err := rows.Scan(&name, &count, &lastAt); err != nil {
+			return err
+		}
+		counts[name] = resetInfo{count: count, lastAt: timePtr(lastAt)}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range accounts {
+		if info, ok := counts[accounts[i].Name]; ok {
+			accounts[i].QuotaResetCount = info.count
+			accounts[i].LastQuotaResetAt = info.lastAt
+		}
+	}
+	return nil
+}
+
+// resetKeeperQuota asks CLIProxyAPI to reset the quota/cooldown state of one
+// auth (by its auth_index) and records the reset in the local counter table.
+// The CLIProxyAPI call must succeed before the counter is incremented.
+// keeperQuotaResetResult is the deliberately minimal wire shape of a reset:
+// it must not leak internal keeperAccount fields (auth_index, email, errors).
+type keeperQuotaResetResult struct {
+	Name             string  `json:"name"`
+	QuotaResetCount  int     `json:"quota_reset_count"`
+	LastQuotaResetAt *string `json:"last_quota_reset_at"`
+}
+
+func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuotaResetResult, error) {
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return keeperQuotaResetResult{}, err
+	}
+	state, err := a.getKeeperState(ctx, authName)
+	if err != nil {
+		return keeperQuotaResetResult{}, err
+	}
+	if state == nil {
+		return keeperQuotaResetResult{}, notFoundError("账号不存在")
+	}
+	if state.AuthIndex == nil || strings.TrimSpace(*state.AuthIndex) == "" {
+		return keeperQuotaResetResult{}, validationError("该账号缺少 auth_index，请先刷新账号列表")
+	}
+	authIndex := strings.TrimSpace(*state.AuthIndex)
+	timeout := time.Duration(cfg.CodexKeeper.CPATimeoutSeconds) * time.Second
+	_, payload, err := a.keeperRequest(ctx, cfg, http.MethodPost, "/v0/management/reset-quota", nil,
+		map[string]any{"auth_index": authIndex}, timeout)
+	if err != nil {
+		return keeperQuotaResetResult{}, err
+	}
+	// A 2xx alone is not proof of a reset: require the CLIProxyAPI response to
+	// confirm status=ok for the exact auth_index we asked about, otherwise fail
+	// closed and do not count the reset.
+	var cpaResult struct {
+		Status    string `json:"status"`
+		AuthIndex string `json:"auth_index"`
+	}
+	// authIndex was already trimmed before the request; require CPA to echo it
+	// exactly (no lenient trimming of the response) to honor the exact-match contract.
+	if err := json.Unmarshal(payload, &cpaResult); err != nil ||
+		cpaResult.Status != "ok" || cpaResult.AuthIndex != authIndex {
+		return keeperQuotaResetResult{}, validationError("CLIProxyAPI 未确认重置成功（响应缺少 status=ok 或 auth_index 不匹配）")
+	}
+	now := dbTime(time.Now())
+	if _, err := a.db.ExecContext(ctx, `
+		INSERT INTO codex_keeper_quota_resets (auth_name, reset_count, last_reset_at)
+		VALUES (?, 1, ?)
+		ON CONFLICT(auth_name) DO UPDATE SET
+			reset_count = codex_keeper_quota_resets.reset_count + 1,
+			last_reset_at = excluded.last_reset_at
+	`, authName, now); err != nil {
+		return keeperQuotaResetResult{}, err
+	}
+	var count int
+	var lastAt sql.NullString
+	if err := a.db.QueryRowContext(ctx, `SELECT reset_count, CAST(last_reset_at AS TEXT) FROM codex_keeper_quota_resets WHERE auth_name = ?`, authName).Scan(&count, &lastAt); err != nil {
+		return keeperQuotaResetResult{}, err
+	}
+	return keeperQuotaResetResult{
+		Name:             authName,
+		QuotaResetCount:  count,
+		LastQuotaResetAt: apiDateTimePtr(timePtr(lastAt)),
+	}, nil
 }
 
 func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[string]bool) (int, error) {
