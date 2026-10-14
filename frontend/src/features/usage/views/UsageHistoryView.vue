@@ -700,6 +700,9 @@ function formatLatency(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) {
     return '-'
   }
+  if (value >= 1000) {
+    return `${+(value / 1000).toFixed(2)} s`
+  }
   return `${formatInteger(Math.round(value))} ms`
 }
 
